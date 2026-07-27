@@ -413,41 +413,88 @@ exact commit moment; now it just says so. Daemons may keep a conservative
 idle/drain inference **only as a fallback** for senders that never send
 `SWITCH_TO_PENDING`.
 
-#### Do not make the promotion depend on the message alone
+#### Why the receiver must not promote on its own
 
-A receiver that waits *only* for `SWITCH_TO_PENDING` before promoting can
-deadlock, because control and audio share one TCP stream and audio can fill
-the pipe ahead of the control message:
+It is tempting to let the receiver decide. TCP ordering appears to hand it a
+sound test: the sender emits all of the old stream's audio, then the
+preannounce, then the new stream's audio, on one connection — so the presence
+of any pending-stream byte proves every old-stream byte already arrived, and
+an empty active buffer therefore means the old track is genuinely finished.
+
+That reasoning is correct, and promoting on it is still wrong. The sender
+trusts POSITION only for the `format_id` **it** considers active. A receiver
+that switches first has every position report it sends discarded by the
+sender, whose played-position then freezes, whose send-pacing gate never
+reopens, and whose newly-promoted stream starves a few seconds later. It
+presents as a track that starts and then stalls, which points nowhere near
+the actual cause.
+
+Seeking close to the end of a track triggers it almost every time: the old
+tail is already consumed before the preannounce even lands, so the "active
+empty, pending non-empty" condition is true the instant the next track is
+announced.
+
+The commit is the sender's to make. A receiver may keep a conservative
+idle/drain inference **only as a fallback** for senders that never send
+`SWITCH_TO_PENDING` at all.
+
+#### The deadlock that makes waiting look impossible
+
+There is a real trap on the other side, and it is worth naming because it is
+what tempts implementers into receiver-side promotion:
 
 1. the receiver's pending buffer fills with the next track's audio;
 2. it stops reading the socket to apply backpressure — but the reading side
    is also what delivers `SWITCH_TO_PENDING`;
-3. the pending buffer is only drained *after* a promotion, which is the
-   thing waiting on the undelivered message.
+3. the pending buffer is only drained *after* a promotion, which is the thing
+   waiting on the undelivered message.
 
-Nothing breaks the cycle except a timeout, so every boundary stalls for its
-full length. It is strongly rate-dependent: DSD fills a buffer fast enough
-to hit it on essentially every track, while PCM at ordinary rates usually
-slips through, which makes it read like a DSD-specific bug rather than a
-structural one.
+Nothing breaks that cycle except a timeout, so every boundary stalls for its
+full length. It is strongly rate-dependent: DSD fills a buffer fast enough to
+hit it on essentially every track, while PCM at ordinary rates usually slips
+through, which makes it read like a DSD-specific bug rather than a structural
+one.
 
-The way out does not need a timeout. **TCP ordering already proves the old
-track is finished**: the sender emits all of the old stream's audio, then
-the preannounce, then the new stream's audio, in that order on one
-connection — so the presence of *any* pending-stream byte means every
-old-stream byte has already arrived. A receiver may therefore promote as
-soon as the active buffer is empty *and* the pending buffer is non-empty,
-and this is sound rather than a guess: an empty active buffer on its own is
-ambiguous (a mid-track network stall looks the same), but combined with
-pending data it is not.
-
-`SWITCH_TO_PENDING` remains the primary signal and the one that carries the
-sender's exact intent — this is an additional sufficient condition, not a
-replacement.
+The fix belongs in the receiver's I/O, not in its promotion policy: **the
+socket reader must never block**. Overflow that does not fit the buffer goes
+somewhere else — the reference daemon spills it to a growable area the
+playback thread drains back — so control messages are always delivered and
+the sender's commit always arrives. Solving it by promoting early instead
+trades a stall that recovers for a starvation that does not.
 
 This is one of the concrete costs of sharing a single stream between control
 and bulk data, and part of the motivation for the channel split in the v2
 proposal below.
+
+### Senders MUST bound lookahead in bytes, not only in time
+
+The same head-of-line hazard has a second, worse form, and closing it is a
+requirement on the *sender*.
+
+A receiver applies backpressure by not reading its socket once its buffer is
+full. That also stops control messages, because they share the socket. While
+**paused** this never recovers on its own: the receiver's writer is stopped,
+so its buffer never drains, so it never resumes reading, so the `RESUME` that
+would restart the writer can never arrive. There is no timeout that can
+rescue it — unlike the gapless case, waiting does not help.
+
+Seconds are the wrong unit to bound this with, because the byte cost of a
+second spans two orders of magnitude across the formats this protocol
+carries:
+
+| format | 5 seconds of lookahead |
+|---|---|
+| PCM 16/44.1 | ~0.9 MB |
+| PCM 24/96 | ~2.9 MB |
+| DSD64 | ~3.5 MB |
+| DSD512 | ~28 MB |
+
+A sender tuned to a comfortable 5s at PCM rates silently demands 28 MB of
+receiver buffer at DSD512. Senders therefore **must** apply a byte ceiling
+alongside whatever time-based pacing they use, and receivers **should** size
+each per-stream buffer above that ceiling with headroom for what is already
+in the socket. The reference implementations use 8 MiB and 16 MiB
+respectively.
 
 ### Cancelling a preannounce
 

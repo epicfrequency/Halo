@@ -18,7 +18,7 @@ SRC = src/main.c src/alsa_output.c
 OBJ = $(SRC:.c=.o)
 BIN = halo-daemon
 
-.PHONY: all clean check check-linux  check-race
+.PHONY: all clean check check-linux check-race check-pause
 
 all: $(BIN)
 
@@ -48,6 +48,24 @@ CHECK_PORT = 5601
 # used to hand the writer thread mid-write, killing playback on every seek
 # and every stop. Verified to fail (hundreds of hits) with the alsa_mtx
 # locking removed, so it is a real regression test and not a tautology.
+# Overfills a paused stream, then checks the daemon still answers control
+# messages. Pre-fix this hangs outright: the reader blocked placing audio into
+# a ring that a stopped writer could never drain, and that same thread is what
+# delivers RESUME — so every pause at DSD rates wedged the daemon until it was
+# restarted. Verified to fail with the overflow path removed.
+check-pause:
+	@echo "==> Paused-and-overfull control-path check"
+	@rm -rf /tmp/halo-pause-rt && mkdir -p /tmp/halo-pause-rt
+	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
+		-DHALO_RUNTIME_DIR='"/tmp/halo-pause-rt"' \
+		src/main.c src/alsa_output.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-pause-daemon
+	@/tmp/halo-pause-daemon stub:0,0 5651 > /tmp/halo-pause.log 2>&1 & \
+		echo $$! > /tmp/halo-pause.pid
+	@sleep 1.5
+	@python3 tools/pause_stall_test.py 5651; rc=$$?; \
+		kill `cat /tmp/halo-pause.pid` 2>/dev/null; \
+		exit $$rc
+
 check-race:
 	@echo "==> FLUSH/FORMAT race stress"
 	@rm -rf /tmp/halo-race-rt && mkdir -p /tmp/halo-race-rt
@@ -69,6 +87,7 @@ check-race:
 
 check:
 	@$(MAKE) --no-print-directory check-race
+	@$(MAKE) --no-print-directory check-pause
 	@echo "==> Running sample-packing tests"
 	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
 		tools/packing_test.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-packing-test

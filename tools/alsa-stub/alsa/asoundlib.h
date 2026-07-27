@@ -55,6 +55,7 @@ int snd_pcm_hw_params_get_rate_max(const snd_pcm_hw_params_t *params, unsigned i
 int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *params, unsigned int *val);
 int snd_pcm_set_chmap(snd_pcm_t *pcm, const snd_pcm_chmap_t *map);
 const char *snd_pcm_format_name(snd_pcm_format_t format);
+int snd_pcm_nonblock(snd_pcm_t *p, int nonblock);
 const char *snd_strerror(int errnum);
 
 /* Linux-only errno values ALSA callers check for; absent on macOS. */

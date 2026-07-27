@@ -103,6 +103,25 @@ typedef struct {
      *
      * Lock order is strictly alsa_mtx *inside* nothing: never acquire
      * state_mtx while holding it. */
+    /* Overflow for audio that arrives faster than its ring drains.
+     *
+     * The reader used to spin here waiting for ring space, which deadlocks
+     * whenever the ring cannot drain: paused, the writer thread is stopped,
+     * so the ring stays full, so the reader stays blocked — and the reader
+     * is what would deliver the RESUME that restarts the writer. Control and
+     * audio share one socket, so blocking on audio blocks control. Unlike
+     * the gapless variant there is no timeout that escapes it.
+     *
+     * Spilling instead keeps the reader always able to reach the next
+     * message. The bytes are not lost and not reordered: once a ring has any
+     * spill, everything for that ring goes to spill until it is empty again,
+     * and only the writer thread moves it back — which it does before its
+     * own pause check, so a resume immediately starts draining both. */
+    uint8_t *spill[2];
+    size_t spill_len[2];
+    size_t spill_cap[2];
+    pthread_mutex_t spill_mtx;
+
     pthread_mutex_t alsa_mtx;
     /* The ALSA frame rate of the currently open device, republished whenever
      * it is (re)opened. The status and position threads need it to turn
@@ -143,6 +162,93 @@ static void send_format_rejected(halo_state_t *st, uint32_t format_id, uint32_t 
 
 /* ---------------- ALSA writer thread ---------------- */
 
+/* Cap past which a sender is simply not honouring the lookahead limit
+ * PROTOCOL.md requires; blocking is then the honest response. Well above the
+ * 8 MiB ceiling the reference sender applies. */
+#define SPILL_MAX_BYTES (64u << 20)
+
+/* Producer side (network thread). Appends to the overflow area. */
+static int spill_append(halo_state_t *st, int idx, const uint8_t *src, size_t len) {
+    pthread_mutex_lock(&st->spill_mtx);
+    size_t needed = st->spill_len[idx] + len;
+    if (needed > SPILL_MAX_BYTES) {
+        pthread_mutex_unlock(&st->spill_mtx);
+        return -1;
+    }
+    if (needed > st->spill_cap[idx]) {
+        size_t cap = st->spill_cap[idx] ? st->spill_cap[idx] : (1u << 20);
+        while (cap < needed) cap *= 2;
+        uint8_t *grown = realloc(st->spill[idx], cap);
+        if (!grown) {
+            pthread_mutex_unlock(&st->spill_mtx);
+            return -1;
+        }
+        st->spill[idx] = grown;
+        st->spill_cap[idx] = cap;
+    }
+    memcpy(st->spill[idx] + st->spill_len[idx], src, len);
+    st->spill_len[idx] = needed;
+    pthread_mutex_unlock(&st->spill_mtx);
+    return 0;
+}
+
+static size_t spill_pending(halo_state_t *st, int idx) {
+    pthread_mutex_lock(&st->spill_mtx);
+    size_t len = st->spill_len[idx];
+    pthread_mutex_unlock(&st->spill_mtx);
+    return len;
+}
+
+/* Discards a stream's buffered audio: the ring and its overflow together,
+ * under one lock.
+ *
+ * They cannot be cleared separately. The overflow made the *writer* thread a
+ * second producer for the ring (it is what moves spilled bytes back in), and
+ * ring_buffer.h's single-producer contract is what makes head/tail safe
+ * without atomics. Clearing the ring outside spill_mtx therefore races the
+ * writer mid-refill and corrupts both indices — a fresh hazard introduced by
+ * the overflow path, not one the ring ever had before it. */
+static void halo_clear_stream(halo_state_t *st, int idx) {
+    pthread_mutex_lock(&st->spill_mtx);
+    st->spill_len[idx] = 0;
+    halo_ring_clear(&st->ring[idx]);
+    pthread_mutex_unlock(&st->spill_mtx);
+}
+
+/* Releases the overflow allocation entirely — for connection teardown, so a
+ * peak that needed tens of MiB isn't held (and mlocked) for the life of the
+ * process. */
+static void spill_release(halo_state_t *st, int idx) {
+    pthread_mutex_lock(&st->spill_mtx);
+    free(st->spill[idx]);
+    st->spill[idx] = NULL;
+    st->spill_len[idx] = 0;
+    st->spill_cap[idx] = 0;
+    pthread_mutex_unlock(&st->spill_mtx);
+}
+
+/* Consumer side (writer thread). Moves as much overflow back into the ring
+ * as currently fits, preserving order. Runs before the pause check so a
+ * paused stream still catches up the instant it resumes. */
+static void spill_drain_into_ring(halo_state_t *st, int idx) {
+    if (spill_pending(st, idx) == 0) return;
+    pthread_mutex_lock(&st->spill_mtx);
+    size_t moved = 0;
+    while (moved < st->spill_len[idx]) {
+        size_t chunk = halo_ring_write(&st->ring[idx], st->spill[idx] + moved,
+                                       st->spill_len[idx] - moved);
+        if (chunk == 0) break;
+        moved += chunk;
+    }
+    if (moved > 0) {
+        st->spill_len[idx] -= moved;
+        if (st->spill_len[idx] > 0) {
+            memmove(st->spill[idx], st->spill[idx] + moved, st->spill_len[idx]);
+        }
+    }
+    pthread_mutex_unlock(&st->spill_mtx);
+}
+
 static void *alsa_writer_thread(void *arg) {
     halo_state_t *st = (halo_state_t *)arg;
     halo_set_realtime_priority();
@@ -152,6 +258,10 @@ static void *alsa_writer_thread(void *arg) {
     if (!scratch) { fprintf(stderr, "halo: OOM in writer thread\n"); return NULL; }
 
     while (atomic_load(&st->running)) {
+        /* Before the pause check on purpose — see the spill fields. */
+        spill_drain_into_ring(st, 0);
+        spill_drain_into_ring(st, 1);
+
         if (atomic_load(&st->paused)) {
             usleep(5000);
             continue;
@@ -199,30 +309,31 @@ static void *alsa_writer_thread(void *arg) {
             if (st->pending_valid) {
                 if (st->switch_requested) {
                     do_switch = 1;
-                } else if (halo_ring_used(&st->ring[1 - st->active_idx]) > 0) {
-                    /* Sound on its own, not a guess — and load-bearing,
-                     * because waiting for SWITCH_TO_PENDING here can
-                     * deadlock. The message shares one TCP stream with bulk
-                     * audio: once the pending ring fills, the network thread
-                     * blocks trying to write more into it, and it is the
-                     * same thread that would deliver SWITCH_TO_PENDING. The
-                     * pending ring is only drained *after* a switch, so
-                     * nothing breaks the cycle except the fallback timeout
-                     * below — which is why every DSD gapless boundary stalled
-                     * for the length of that timeout while PCM, with a far
-                     * lower byte rate, usually squeaked through.
-                     *
-                     * TCP ordering is what makes this safe. The sender emits
-                     * all of the old stream's audio, then the preannounce,
-                     * then the new stream's audio, in that order on one
-                     * connection. So the presence of *any* pending-stream
-                     * byte proves every old-stream byte already arrived, and
-                     * an empty active ring therefore means the old track is
-                     * genuinely finished — not the mid-track network stall
-                     * that an empty ring alone could also mean. ALSA's own
-                     * buffered tail is untouched and still plays out. */
-                    do_switch = 1;
                 } else {
+                    /* Deliberately no "pending ring has data" shortcut here.
+                     *
+                     * An earlier version promoted as soon as the active ring
+                     * was empty and the pending one was not, reasoning from
+                     * TCP ordering that this proves the old track finished.
+                     * The reasoning holds; promoting on it does not. The
+                     * sender trusts POSITION only for the format_id *it*
+                     * considers active, so a receiver that switches first
+                     * has every position report it sends discarded — the
+                     * sender's played-position freezes, its send-pacing gate
+                     * never reopens, and the stream it just switched to
+                     * starves. Seeking near the end of a track made it fire
+                     * on essentially every boundary, because the old tail is
+                     * already consumed by the time the preannounce lands.
+                     *
+                     * That shortcut existed to escape a deadlock: with the
+                     * reader blocked on a full pending ring, SWITCH_TO_PENDING
+                     * could never be delivered. The overflow buffer removed
+                     * that — the reader no longer blocks, so the message
+                     * always arrives and the sender's commit is once again
+                     * the only thing that should move the boundary.
+                     *
+                     * What remains is only the conservative idle fallback,
+                     * for senders that never send SWITCH_TO_PENDING at all. */
                     uint64_t last = atomic_load(&st->last_active_data_ns);
                     do_switch = (mono_ns() - last) > PENDING_SWITCH_FALLBACK_NS;
                     if (do_switch) {
@@ -254,13 +365,20 @@ static void *alsa_writer_thread(void *arg) {
                         pthread_mutex_lock(&st->state_mtx);
                         st->pending_valid = 0;
                         st->switch_requested = 0;
+                        /* Discard what was staged for it too. Nothing will
+                         * ever consume that ring now, and leaving the spill
+                         * non-empty makes every later byte for this slot
+                         * queue behind bytes that can never move. */
+                        halo_clear_stream(st, other);
                         pthread_mutex_unlock(&st->state_mtx);
                         continue;
                     }
                     pthread_mutex_lock(&st->state_mtx);
                 }
-                /* Re-check under lock in case a FLUSH raced with us */
-                if (st->pending_valid) {
+                /* Re-check under lock in case a FLUSH or a cancel raced with
+                 * us while the lock was dropped for the reopen. */
+                int committed = st->pending_valid;
+                if (committed) {
                     st->active_idx = other;
                     st->pending_valid = 0;
                     st->switch_requested = 0;
@@ -274,6 +392,31 @@ static void *alsa_writer_thread(void *arg) {
                             next_fid, same ? "no" : "with");
                 }
                 pthread_mutex_unlock(&st->state_mtx);
+
+                if (!committed && !same) {
+                    /* The device was already reconfigured for a track we are
+                     * now not switching to, and the old stream is still the
+                     * active one — so without this every subsequent write
+                     * feeds old-format bytes through a device set up for the
+                     * new format. That is not a stall or a dropout: it plays,
+                     * loudly, as noise. Put the device back. */
+                    fprintf(stderr, "halo: gapless switch to format_id=%u abandoned after "
+                                    "reopen, restoring the active format\n", next_fid);
+                    pthread_mutex_lock(&st->alsa_mtx);
+                    int restore_failed = halo_alsa_open(&st->alsa, st->alsa_device, &fmt) != 0;
+                    atomic_store(&st->active_alsa_rate,
+                                 restore_failed ? 0u : halo_alsa_current_rate(&st->alsa));
+                    pthread_mutex_unlock(&st->alsa_mtx);
+                    if (restore_failed) {
+                        fprintf(stderr, "halo: could not restore the active format, closing stream\n");
+                        pthread_mutex_lock(&st->state_mtx);
+                        st->stream_open = 0;
+                        halo_clear_stream(st, 0);
+                        halo_clear_stream(st, 1);
+                        pthread_mutex_unlock(&st->state_mtx);
+                        send_format_rejected(st, fid, HALO_REJECT_DEVICE_BUSY);
+                    }
+                }
                 continue; /* re-loop, will pick up new active idx */
             }
             pthread_mutex_unlock(&st->state_mtx);
@@ -328,6 +471,14 @@ static void *alsa_writer_thread(void *arg) {
             fprintf(stderr, "halo: fatal ALSA error, closing stream\n");
             pthread_mutex_lock(&st->state_mtx);
             st->stream_open = 0;
+            /* Nothing will consume either stream now. Anything still
+             * buffered would sit there until the connection ends, and audio
+             * still arriving for the pending slot would keep accumulating
+             * against a writer that has stopped. */
+            st->pending_valid = 0;
+            st->switch_requested = 0;
+            halo_clear_stream(st, 0);
+            halo_clear_stream(st, 1);
             pthread_mutex_unlock(&st->state_mtx);
             send_format_rejected(st, fid, HALO_REJECT_DEVICE_BUSY);
         }
@@ -429,10 +580,20 @@ static void report_status(halo_state_t *st, int force) {
         uint64_t frames = atomic_load(&st->frames_written);
         unsigned secs = rate ? (unsigned)(frames / rate) : 0u;
 
+        /* Overflow is worth showing whenever it is non-zero: it means the
+         * sender is running further ahead than the ring holds, which used to
+         * be the invisible precondition of a wedged daemon. Now it is
+         * survivable — but still the thing to look at first. */
+        size_t spilled = spill_pending(st, idx);
+        char spill_note[32] = "";
+        if (spilled > 0) {
+            snprintf(spill_note, sizeof(spill_note), " | spill %zuMiB", spilled >> 20);
+        }
+
         snprintf(line, sizeof(line),
-                 "[halo] %s | fmt#%u%s | ring %u%% | %u:%02u:%02u | xrun %llu%s",
+                 "[halo] %s | fmt#%u%s | ring %u%%%s | %u:%02u:%02u | xrun %llu%s",
                  fmt_desc, fid, pending ? " (+pending)" : "",
-                 ring_pct, secs / 3600, (secs / 60) % 60, secs % 60,
+                 ring_pct, spill_note, secs / 3600, (secs / 60) % 60, secs % 60,
                  (unsigned long long)atomic_load(&st->underrun_count),
                  atomic_load(&st->paused) ? " | PAUSED" : "");
     }
@@ -587,11 +748,18 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
     pthread_mutex_lock(&st->state_mtx);
 
     if (!st->stream_open) {
-        /* First format of the connection: open for real, right away. */
+        /* First format of the connection — or the first after a fatal
+         * device error closed the previous one. Both start from nothing, so
+         * every trace of the old plan goes: a pending slot left over from a
+         * stream that died still looks promotable to the writer, which would
+         * hand the listener a track that was abandoned minutes ago. */
         st->active_idx = 0;
         st->fmt[0] = *fmt;
         st->format_id[0] = fmt->format_id;
-        halo_ring_clear(&st->ring[0]);
+        st->pending_valid = 0;
+        st->switch_requested = 0;
+        halo_clear_stream(st, 0);
+        halo_clear_stream(st, 1);
         pthread_mutex_unlock(&st->state_mtx);
 
         atomic_fetch_add(&st->audio_epoch, 1);
@@ -632,10 +800,13 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
                     fmt->format_id, st->format_id[1 - st->active_idx]);
         }
         int other = 1 - st->active_idx;
-        halo_ring_clear(&st->ring[other]);
+        halo_clear_stream(st, other);
         st->fmt[other] = *fmt;
         st->format_id[other] = fmt->format_id;
         st->pending_valid = 1;
+        /* Each preannounce waits for its own commit — never inherits one
+         * left behind by a slot that was cancelled or overwritten. */
+        st->switch_requested = 0;
         pthread_mutex_unlock(&st->state_mtx);
         fprintf(stderr, "halo: preannounce received, format_id=%u\n", fmt->format_id);
         return;
@@ -661,8 +832,8 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
      * out of the ring we are about to clear, and those belong to the
      * playback plan being abandoned. */
     atomic_fetch_add(&st->audio_epoch, 1);
-    halo_ring_clear(&st->ring[st->active_idx]);
-    halo_ring_clear(&st->ring[other]);
+    halo_clear_stream(st, st->active_idx);
+    halo_clear_stream(st, other);
     st->fmt[other] = *fmt;
     st->format_id[other] = fmt->format_id;
     st->pending_valid = 1;
@@ -736,17 +907,42 @@ static void handle_audio_data(halo_state_t *st, uint32_t payload_len, uint64_t s
             continue;
         }
 
-        /* recv() straight into the ring's writable span: one copy
-         * (kernel -> ring) instead of two (kernel -> stack -> ring). Safe
-         * without extra locking because this thread is the ring's only
-         * producer — and it is also the thread that runs handle_flush(), so
-         * a clear can never land in the middle of one of these writes. */
+        /* Anything already spilled has to go in front of these bytes, so
+         * once a ring is in overflow everything for it keeps going there
+         * until the writer has drained it. */
         uint8_t *dst = NULL;
-        size_t space = halo_ring_writable(&st->ring[target_idx], &dst);
+        size_t space = spill_pending(st, target_idx) > 0
+                           ? 0
+                           : halo_ring_writable(&st->ring[target_idx], &dst);
+
         if (space == 0) {
-            usleep(1000); /* ring full: back off instead of dropping audio */
+            /* Overflow path. Never blocks: blocking here is what wedged the
+             * daemon whenever the ring could not drain (see the spill
+             * fields), because the same thread delivers PAUSE/RESUME/FLUSH. */
+            uint8_t staging[65536];
+            uint32_t want = remaining < sizeof(staging) ? remaining : (uint32_t)sizeof(staging);
+            if (halo_read_full(fd, staging, want) < 0) {
+                atomic_store(&st->running, 0);
+                return;
+            }
+            if (spill_append(st, target_idx, staging, want) < 0) {
+                /* Only reachable from a sender ignoring the lookahead limit.
+                 * Drop rather than grow without bound, and say so — silent
+                 * loss here would surface much later as an unexplained
+                 * glitch. */
+                fprintf(stderr, "halo: overflow buffer full (%u MiB), dropping %u bytes — "
+                                "sender is running further ahead than the protocol allows\n",
+                        SPILL_MAX_BYTES >> 20, want);
+            }
+            remaining -= want;
             continue;
         }
+
+        /* Fast path: recv() straight into the ring's writable span, one copy
+         * (kernel -> ring) instead of two. Safe without extra locking
+         * because this thread is the ring's only producer — and it is also
+         * the thread that runs handle_flush(), so a clear can never land in
+         * the middle of one of these writes. */
         uint32_t want = remaining < space ? remaining : (uint32_t)space;
         if (halo_read_full(fd, dst, want) < 0) {
             atomic_store(&st->running, 0);
@@ -761,8 +957,13 @@ static void handle_cancel_preannounce(halo_state_t *st, const struct halo_cancel
     pthread_mutex_lock(&st->state_mtx);
     int other = 1 - st->active_idx;
     if (st->pending_valid && msg->format_id == st->format_id[other]) {
-        halo_ring_clear(&st->ring[other]);
+        halo_clear_stream(st, other);
         st->pending_valid = 0;
+        /* The commit intent has to go with it. Leaving it set means the next
+         * preannounce inherits a promotion nobody asked for and gets flipped
+         * to the moment the active ring dips empty — a track change with no
+         * SWITCH_TO_PENDING behind it. */
+        st->switch_requested = 0;
         pthread_mutex_unlock(&st->state_mtx);
         fprintf(stderr, "halo: preannounce format_id=%u cancelled by sender\n", msg->format_id);
         return;
@@ -893,7 +1094,7 @@ static void handle_flush(halo_state_t *st) {
      * recognised as pre-flush even if it read them a moment ago. */
     atomic_fetch_add(&st->audio_epoch, 1);
     pthread_mutex_lock(&st->state_mtx);
-    halo_ring_clear(&st->ring[st->active_idx]);
+    halo_clear_stream(st, st->active_idx);
     st->pending_valid = 0;
     st->switch_requested = 0;
     pthread_mutex_unlock(&st->state_mtx);
@@ -1022,6 +1223,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&st.send_mtx, NULL);
     pthread_mutex_init(&st.state_mtx, NULL);
     pthread_mutex_init(&st.alsa_mtx, NULL);
+    pthread_mutex_init(&st.spill_mtx, NULL);
 
     if (halo_ring_init(&st.ring[0], RING_CAPACITY) != 0 ||
         halo_ring_init(&st.ring[1], RING_CAPACITY) != 0) {
@@ -1093,6 +1295,14 @@ int main(int argc, char **argv) {
          * this daemon would hold it until the next write failed, refusing new
          * clients in the meantime. Values mirror the sender's side. */
         setsockopt(conn_fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+        /* What makes the bounded loops in net_io.h possible — without these
+         * every recv/send is an indefinite block. Keepalive above catches a
+         * peer that died; these catch one that is alive but stuck. */
+        {
+            struct timeval tv = { .tv_sec = HALO_SOCKET_TIMEOUT_SECONDS, .tv_usec = 0 };
+            setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
 #ifdef TCP_KEEPIDLE
         { int v = 15; setsockopt(conn_fd, IPPROTO_TCP, TCP_KEEPIDLE,  &v, sizeof(v)); }
         { int v = 5;  setsockopt(conn_fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v)); }
@@ -1113,8 +1323,8 @@ int main(int argc, char **argv) {
         atomic_store(&st.frames_written, 0);
         atomic_store(&st.underrun_count, 0);
         atomic_store(&st.last_active_data_ns, mono_ns());
-        halo_ring_clear(&st.ring[0]);
-        halo_ring_clear(&st.ring[1]);
+        halo_clear_stream(&st, 0);
+        halo_clear_stream(&st, 1);
 
         pthread_t writer_tid, pos_tid;
         pthread_create(&writer_tid, NULL, alsa_writer_thread, &st);
@@ -1130,6 +1340,8 @@ int main(int argc, char **argv) {
         if (st.alsa.is_open) halo_alsa_close(&st.alsa);
         pthread_mutex_unlock(&st.alsa_mtx);
         close(conn_fd);
+        spill_release(&st, 0);
+        spill_release(&st, 1);
         if (!g_shutdown) {
             fprintf(stderr, "halo: client disconnected, waiting for next connection\n");
         }

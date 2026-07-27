@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* Which physical ALSA DSD packing to use for native DSD frames on the
  * wire. U32_LE is what most modern async USB DAC drivers (XMOS/Amanero
@@ -508,10 +509,25 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
             continue;
         }
         if (written == -ESTRPIPE) {
+            /* Bounded, and it sleeps. The original spun on -EAGAIN with no
+             * delay and no limit — on a SCHED_FIFO thread holding the device
+             * lock, so a suspend that never resumes cleanly would peg a core
+             * at real-time priority and wedge the socket reader behind the
+             * lock at the same time. snd_pcm_prepare() is the correct
+             * fallback: resuming is an optimisation that preserves the
+             * buffered tail, and starting fresh is always available. */
             fprintf(stderr, "halo: ALSA suspended, attempting resume\n");
-            while (snd_pcm_resume(ctx->pcm) == -EAGAIN) {
-                /* busy-wait briefly; real deployments may want a sleep here */
+            int resume_waited_ms = 0;
+            int resume_err;
+            while ((resume_err = snd_pcm_resume(ctx->pcm)) == -EAGAIN) {
+                if (resume_waited_ms >= 2000) {
+                    fprintf(stderr, "halo: resume did not complete, restarting the stream\n");
+                    break;
+                }
+                usleep(10000);
+                resume_waited_ms += 10;
             }
+            (void)resume_err;
             snd_pcm_prepare(ctx->pcm);
             continue;
         }
@@ -553,7 +569,38 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
 
 int halo_alsa_drain(halo_alsa_ctx_t *ctx) {
     if (!ctx->is_open) return 0;
-    return snd_pcm_drain(ctx->pcm);
+
+    /* Bounded, because a blocking snd_pcm_drain() can wait forever and the
+     * caller holds the device lock across it. A stream that is not actually
+     * running — stopped after an underrun, or prepared but never started —
+     * has nothing draining it, so the wait never ends; the FLUSH that would
+     * clear the situation is stuck behind the same lock, on the very thread
+     * that reads the socket, so nothing can arrive to break it either. Same
+     * permanent wedge as blocking the reader directly, reached by a
+     * different route.
+     *
+     * Non-blocking mode turns the wait into a poll this function controls.
+     * Draining is a courtesy at a format-changing handover (let the old
+     * tail finish), never a correctness requirement, so giving up and
+     * dropping is a sound worst case: at most the last fraction of a second
+     * of the outgoing track is cut. */
+    const int deadline_ms = 3000;
+    int waited_ms = 0;
+    snd_pcm_nonblock(ctx->pcm, 1);
+    int err;
+    while ((err = snd_pcm_drain(ctx->pcm)) == -EAGAIN) {
+        if (waited_ms >= deadline_ms) {
+            fprintf(stderr, "halo: drain did not finish in %dms, dropping the tail\n",
+                    deadline_ms);
+            snd_pcm_nonblock(ctx->pcm, 0);
+            snd_pcm_drop(ctx->pcm);
+            return snd_pcm_prepare(ctx->pcm);
+        }
+        usleep(5000);
+        waited_ms += 5;
+    }
+    snd_pcm_nonblock(ctx->pcm, 0);
+    return err;
 }
 
 int halo_alsa_drop_and_prepare(halo_alsa_ctx_t *ctx) {

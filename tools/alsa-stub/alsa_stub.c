@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE /* usleep() under -std=c11 on glibc; must precede every header */
 #include <alsa/asoundlib.h>
 #include <stdio.h>
 #include <errno.h>
@@ -32,6 +33,7 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, snd_pcm_stream_t s, int m) {
 }
 int snd_pcm_close(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_prepare(snd_pcm_t *p) { p->epoch++; p->state = STUB_PREPARED; return 0; }
+int snd_pcm_nonblock(snd_pcm_t *p, int nonblock) { (void)p; (void)nonblock; return 0; }
 int snd_pcm_drain(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_drop(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_resume(snd_pcm_t *p) { p->epoch++; p->state = STUB_PREPARED; return 0; }
