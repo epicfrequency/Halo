@@ -18,7 +18,7 @@ SRC = src/main.c src/alsa_output.c
 OBJ = $(SRC:.c=.o)
 BIN = halo-daemon
 
-.PHONY: all clean check check-linux
+.PHONY: all clean check check-linux  check-race
 
 all: $(BIN)
 
@@ -42,7 +42,33 @@ STUB_DIR = tools/alsa-stub
 CHECK_RUNTIME = /tmp/halo-selftest
 CHECK_PORT = 5601
 
+# Drives FLUSH and hard-cut FORMAT against a live audio feed, with the stub's
+# writes made to block so they actually overlap the control path. Asserts the
+# daemon never sees -EBADFD — the error the network thread's snd_pcm_drop()
+# used to hand the writer thread mid-write, killing playback on every seek
+# and every stop. Verified to fail (hundreds of hits) with the alsa_mtx
+# locking removed, so it is a real regression test and not a tautology.
+check-race:
+	@echo "==> FLUSH/FORMAT race stress"
+	@rm -rf /tmp/halo-race-rt && mkdir -p /tmp/halo-race-rt
+	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
+		-DHALO_RUNTIME_DIR='"/tmp/halo-race-rt"' \
+		src/main.c src/alsa_output.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-race-daemon
+	@HALO_STUB_WRITE_DELAY_US=4000 /tmp/halo-race-daemon stub:0,0 5641 > /tmp/halo-race.log 2>&1 & \
+		echo $$! > /tmp/halo-race.pid
+	@sleep 1.5
+	@python3 tools/race_stress.py 5641 6; rc=$$?; \
+		kill `cat /tmp/halo-race.pid` 2>/dev/null; \
+		hits=`grep -c 'bad state' /tmp/halo-race.log || true`; \
+		if [ "$$hits" != "0" ]; then \
+			echo "  FAIL  $$hits ALSA bad-state hits — the device is being touched from two threads"; \
+			exit 1; \
+		fi; \
+		if [ $$rc -ne 0 ]; then exit $$rc; fi; \
+		echo "  PASS  no ALSA bad-state hits under FLUSH/FORMAT storm"
+
 check:
+	@$(MAKE) --no-print-directory check-race
 	@echo "==> Running sample-packing tests"
 	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
 		tools/packing_test.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-packing-test

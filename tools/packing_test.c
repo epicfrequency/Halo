@@ -149,13 +149,24 @@ int main(void) {
         0x77, 0x88, 0x99,   0xAA, 0xBB, 0xCC,   /* frame 1: L, R */
     };
     uint8_t widened[16];
-    widen_s24_to_s32(pcm_in, widened, 4);
+    widen_pcm_to_s32(pcm_in, widened, 4, 3);
     static const uint8_t want_widened[] = {
         0x00, 0x11, 0x22, 0x33,   0x00, 0x44, 0x55, 0x66,
         0x00, 0x77, 0x88, 0x99,   0x00, 0xAA, 0xBB, 0xCC,
     };
     expect_bytes("24-bit widens left-justified into S32_LE",
                  widened, want_widened, sizeof(want_widened));
+
+    /* 16-bit needs the same treatment: DACs offering only S32_LE are common,
+     * and refusing them would rule out ordinary CD-rate material. */
+    static const uint8_t pcm16_in[] = { 0x11, 0x22,  0x33, 0x44 };
+    uint8_t widened16[8];
+    widen_pcm_to_s32(pcm16_in, widened16, 2, 2);
+    static const uint8_t want_widened16[] = {
+        0x00, 0x00, 0x11, 0x22,   0x00, 0x00, 0x33, 0x44,
+    };
+    expect_bytes("16-bit widens left-justified into S32_LE",
+                 widened16, want_widened16, sizeof(want_widened16));
 
     if (failures) {
         printf("\n%d packing check(s) failed\n", failures);

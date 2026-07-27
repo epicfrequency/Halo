@@ -73,6 +73,40 @@ typedef struct {
     int sockfd;
     pthread_mutex_t send_mtx;
     pthread_mutex_t state_mtx;
+    /* Guards the ALSA handle itself. state_mtx protects the routing state
+     * (which ring is active, what format it holds); it does *not* protect
+     * `alsa`, and the two are deliberately separate because every ALSA call
+     * here blocks — holding state_mtx across a drain would stall the network
+     * thread for the length of the buffer.
+     *
+     * Without this lock the network thread's snd_pcm_drop() (FLUSH, i.e.
+     * every seek and every stop) races the writer thread sitting inside
+     * snd_pcm_writei(). drop() leaves the stream in SETUP, and a write in
+     * that state returns -EBADFD, which the writer treats as fatal: the
+     * stream closes and playback dies. The same race exists between the
+     * writer's gapless reopen and a hard-cut FORMAT arriving on the network
+     * thread, where it is worse — one thread closes the handle the other is
+     * still writing through.
+     *
+     * Lock order is strictly alsa_mtx *inside* nothing: never acquire
+     * state_mtx while holding it. */
+    pthread_mutex_t alsa_mtx;
+    /* The ALSA frame rate of the currently open device, republished whenever
+     * it is (re)opened. The status and position threads need it to turn
+     * frames into elapsed time, and reading it straight out of the ALSA ctx
+     * meant reading a format another thread was mid-way through rewriting.
+     * Guarding that read with alsa_mtx would have been correct too, but it
+     * would put a low-priority reporting thread behind a blocking write on
+     * the audio path; publishing a scalar keeps them decoupled. */
+    _Atomic unsigned int active_alsa_rate;
+    /* Bumped whenever buffered audio stops being valid (FLUSH, hard-cut
+     * FORMAT). The writer copies bytes out of the ring before it can take
+     * alsa_mtx, so clearing the ring alone leaves up to one period of
+     * already-copied pre-seek audio that would still be written after the
+     * drop — the same residual-audio class as the ring and socket cases,
+     * just one layer further down. The writer re-checks this after it
+     * acquires the lock and discards its scratch if it changed. */
+    _Atomic uint32_t audio_epoch;
     _Atomic uint64_t seq_counter;
 } halo_state_t;
 
@@ -171,8 +205,13 @@ static void *alsa_writer_thread(void *arg) {
                     /* Unlock while doing the (slow, blocking) drain/reopen
                      * so we don't hold state_mtx across I/O. */
                     pthread_mutex_unlock(&st->state_mtx);
+                    pthread_mutex_lock(&st->alsa_mtx);
                     halo_alsa_drain(&st->alsa);
-                    if (halo_alsa_open(&st->alsa, st->alsa_device, &next_fmt) != 0) {
+                    int reopen_failed = halo_alsa_open(&st->alsa, st->alsa_device, &next_fmt) != 0;
+                    atomic_store(&st->active_alsa_rate,
+                                 reopen_failed ? 0u : halo_alsa_current_rate(&st->alsa));
+                    pthread_mutex_unlock(&st->alsa_mtx);
+                    if (reopen_failed) {
                         /* The next track's format won't open. Say so rather
                          * than switching to a stream that can never play. */
                         send_format_rejected(st, next_fid, HALO_REJECT_DEVICE_BUSY);
@@ -206,11 +245,14 @@ static void *alsa_writer_thread(void *arg) {
             continue;
         }
 
-        size_t want = st->alsa.period_size > 0
-                          ? (size_t)st->alsa.period_size * align_bytes
-                          : buf_bytes;
+        pthread_mutex_lock(&st->alsa_mtx);
+        snd_pcm_uframes_t period = st->alsa.period_size;
+        pthread_mutex_unlock(&st->alsa_mtx);
+
+        size_t want = period > 0 ? (size_t)period * align_bytes : buf_bytes;
         if (want > buf_bytes) want = buf_bytes;
         if (want > usable_bytes) want = usable_bytes; /* never pull a partial trailing frame */
+        uint32_t epoch_at_read = atomic_load(&st->audio_epoch);
         size_t got = halo_ring_read(&st->ring[idx], scratch, want);
         if (got == 0) continue;
 
@@ -219,7 +261,17 @@ static void *alsa_writer_thread(void *arg) {
         if (nframes == 0) continue;
 
         int underrun = 0;
-        snd_pcm_sframes_t written = halo_alsa_write(&st->alsa, scratch, nframes, &underrun);
+        pthread_mutex_lock(&st->alsa_mtx);
+        snd_pcm_sframes_t written;
+        if (atomic_load(&st->audio_epoch) != epoch_at_read) {
+            /* A FLUSH or hard-cut FORMAT landed while these bytes were in
+             * flight. They belong to the position we just left; writing them
+             * would put a fragment of the old audio after the seek. */
+            written = 0;
+        } else {
+            written = halo_alsa_write(&st->alsa, scratch, nframes, &underrun);
+        }
+        pthread_mutex_unlock(&st->alsa_mtx);
 
         if (underrun) {
             atomic_fetch_add(&st->underrun_count, 1);
@@ -334,7 +386,7 @@ static void report_status(halo_state_t *st, int force) {
          * print-on-change filter below. */
         ring_pct = (ring_pct / 5) * 5;
 
-        unsigned int rate = halo_alsa_current_rate(&st->alsa);
+        unsigned int rate = atomic_load(&st->active_alsa_rate);
         uint64_t frames = atomic_load(&st->frames_written);
         unsigned secs = rate ? (unsigned)(frames / rate) : 0u;
 
@@ -366,7 +418,7 @@ static void report_status(halo_state_t *st, int force) {
     } else {
         char fmt_desc[96];
         describe_format(&fmt, fmt_desc, sizeof(fmt_desc));
-        unsigned int rate = halo_alsa_current_rate(&st->alsa);
+        unsigned int rate = atomic_load(&st->active_alsa_rate);
         uint64_t frames = atomic_load(&st->frames_written);
         size_t used = halo_ring_used(&st->ring[idx]);
         n = snprintf(json, sizeof(json),
@@ -499,7 +551,13 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
         halo_ring_clear(&st->ring[0]);
         pthread_mutex_unlock(&st->state_mtx);
 
-        if (halo_alsa_open(&st->alsa, st->alsa_device, fmt) != 0) {
+        atomic_fetch_add(&st->audio_epoch, 1);
+        pthread_mutex_lock(&st->alsa_mtx);
+        int open_failed = halo_alsa_open(&st->alsa, st->alsa_device, fmt) != 0;
+        atomic_store(&st->active_alsa_rate,
+                     open_failed ? 0u : halo_alsa_current_rate(&st->alsa));
+        pthread_mutex_unlock(&st->alsa_mtx);
+        if (open_failed) {
             fprintf(stderr, "halo: initial ALSA open failed for requested format\n");
             send_format_rejected(st, fmt->format_id, HALO_REJECT_DEVICE_BUSY);
             return;
@@ -556,6 +614,10 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
      * state clears: announcing a fresh active stream is an unambiguous
      * statement of intent to play it. */
     int other = 1 - st->active_idx;
+    /* Same reason FLUSH bumps it: the writer may already hold bytes copied
+     * out of the ring we are about to clear, and those belong to the
+     * playback plan being abandoned. */
+    atomic_fetch_add(&st->audio_epoch, 1);
     halo_ring_clear(&st->ring[st->active_idx]);
     halo_ring_clear(&st->ring[other]);
     st->fmt[other] = *fmt;
@@ -784,13 +846,18 @@ static void handle_coverart(halo_state_t *st, uint32_t len, int fd) {
 }
 
 static void handle_flush(halo_state_t *st) {
+    /* Bump before clearing, so any bytes the writer already copied out are
+     * recognised as pre-flush even if it read them a moment ago. */
+    atomic_fetch_add(&st->audio_epoch, 1);
     pthread_mutex_lock(&st->state_mtx);
     halo_ring_clear(&st->ring[st->active_idx]);
     st->pending_valid = 0;
     st->switch_requested = 0;
     pthread_mutex_unlock(&st->state_mtx);
 
+    pthread_mutex_lock(&st->alsa_mtx);
     halo_alsa_drop_and_prepare(&st->alsa);
+    pthread_mutex_unlock(&st->alsa_mtx);
     atomic_store(&st->frames_written, 0);
     /* FLUSH clears paused state per PROTOCOL.md's pause rules — the sender
      * re-pauses explicitly if it was seeking while paused. */
@@ -911,6 +978,7 @@ int main(int argc, char **argv) {
     strncpy(st.alsa_device, device, sizeof(st.alsa_device) - 1);
     pthread_mutex_init(&st.send_mtx, NULL);
     pthread_mutex_init(&st.state_mtx, NULL);
+    pthread_mutex_init(&st.alsa_mtx, NULL);
 
     if (halo_ring_init(&st.ring[0], RING_CAPACITY) != 0 ||
         halo_ring_init(&st.ring[1], RING_CAPACITY) != 0) {
@@ -1015,7 +1083,9 @@ int main(int argc, char **argv) {
         pthread_join(writer_tid, NULL);
         pthread_join(pos_tid, NULL);
 
+        pthread_mutex_lock(&st.alsa_mtx);
         if (st.alsa.is_open) halo_alsa_close(&st.alsa);
+        pthread_mutex_unlock(&st.alsa_mtx);
         close(conn_fd);
         if (!g_shutdown) {
             fprintf(stderr, "halo: client disconnected, waiting for next connection\n");

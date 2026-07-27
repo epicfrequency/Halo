@@ -252,13 +252,18 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
     snd_pcm_format_t alsa_fmt = pcm_format_for(fmt);
     ctx->widen_to_s32 = 0;
     err = snd_pcm_hw_params_set_format(ctx->pcm, params, alsa_fmt);
-    if (err < 0 && fmt->is_dsd == HALO_FMT_PCM && fmt->bits_per_sample == 24) {
+    if (err < 0 && fmt->is_dsd == HALO_FMT_PCM &&
+        (fmt->bits_per_sample == 16 || fmt->bits_per_sample == 24)) {
+        /* Widening is only ever upward, so nothing is lost: the sample keeps
+         * every bit it had and gains zeros below it. Narrowing (a 32-bit
+         * track on a 24-bit-only device) would be a truncation, so it is not
+         * attempted — that stays a rejection the sender can act on. */
         int widened = snd_pcm_hw_params_set_format(ctx->pcm, params,
                                                    SND_PCM_FORMAT_S32_LE);
         if (widened == 0) {
             fprintf(stderr, "halo: device has no %s, using S32_LE "
-                            "(24-bit samples left-justified, still bit-exact)\n",
-                    snd_pcm_format_name(alsa_fmt));
+                            "(%u-bit samples left-justified, still bit-exact)\n",
+                    snd_pcm_format_name(alsa_fmt), fmt->bits_per_sample);
             alsa_fmt = SND_PCM_FORMAT_S32_LE;
             ctx->widen_to_s32 = 1;
             err = 0;
@@ -363,16 +368,21 @@ static int ensure_convert_buf(halo_alsa_ctx_t *ctx, size_t bytes) {
     return 0;
 }
 
-/* Left-justify 3-byte samples into 4-byte containers, for DACs that offer
- * S32_LE but no real 24-bit format. The sample must sit in the *top* three
- * bytes: right-justifying it instead still plays, just 256x too quiet. */
-static void widen_s24_to_s32(const uint8_t *in, uint8_t *out, size_t samples) {
+/* Left-justify narrower little-endian samples into 4-byte containers, for
+ * DACs that offer S32_LE and nothing else — which is common enough that
+ * refusing those tracks would rule out most of a CD-rip library on some
+ * hardware. `src_bytes` is 2 (16-bit) or 3 (24-bit).
+ *
+ * The sample must sit in the *top* bytes. Right-justifying instead is the
+ * tempting mistake: it still plays, at 1/256 or 1/65536 amplitude, which
+ * reads as a volume or gain-staging problem rather than a packing one. */
+static void widen_pcm_to_s32(const uint8_t *in, uint8_t *out, size_t samples,
+                             size_t src_bytes) {
+    size_t pad = 4 - src_bytes;
     for (size_t i = 0; i < samples; i++) {
-        out[0] = 0;           /* low byte the DAC will ignore */
-        out[1] = in[0];
-        out[2] = in[1];
-        out[3] = in[2];       /* sign/MSB stays in the top byte */
-        in += 3;
+        for (size_t b = 0; b < pad; b++) out[b] = 0;
+        for (size_t b = 0; b < src_bytes; b++) out[pad + b] = in[b];
+        in += src_bytes;
         out += 4;
     }
 }
@@ -478,13 +488,15 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
         size_t out_frame_bytes = (size_t)ctx->fmt.channels * 4;
         size_t needed = out_frame_bytes * (size_t)remaining;
         if (ensure_convert_buf(ctx, needed) < 0) return -1;
-        widen_s24_to_s32((const uint8_t *)frames, ctx->convert_buf,
-                         (size_t)remaining * ctx->fmt.channels);
+        widen_pcm_to_s32((const uint8_t *)frames, ctx->convert_buf,
+                         (size_t)remaining * ctx->fmt.channels,
+                         (size_t)ctx->fmt.bits_per_sample / 8);
         cursor = ctx->convert_buf;
         frame_bytes = out_frame_bytes;
     }
 
     const snd_pcm_uframes_t total_frames = remaining;
+    int bad_state_retried = 0;
 
     while (remaining > 0) {
         snd_pcm_sframes_t written = snd_pcm_writei(ctx->pcm, cursor, remaining);
@@ -505,6 +517,21 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
         }
         if (written == -EINTR || written == -EAGAIN) {
             continue;
+        }
+        if (written == -EBADFD) {
+            /* The stream is not in a writable state — most often SETUP,
+             * left there by an snd_pcm_drop() that ran between this write
+             * and the last. The daemon serialises those now (alsa_mtx), so
+             * reaching here means something got past that; recover once
+             * rather than treating it as fatal, since tearing the stream
+             * down costs the listener the rest of the track while a
+             * prepare() usually costs nothing. Only one attempt: if the
+             * state is genuinely broken, retrying forever would spin. */
+            if (!bad_state_retried) {
+                bad_state_retried = 1;
+                fprintf(stderr, "halo: ALSA in bad state (-EBADFD), re-preparing\n");
+                if (snd_pcm_prepare(ctx->pcm) == 0) continue;
+            }
         }
         if (written < 0) {
             fprintf(stderr, "halo: unrecoverable ALSA write error: %s\n",

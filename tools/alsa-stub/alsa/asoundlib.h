@@ -61,3 +61,6 @@ const char *snd_strerror(int errnum);
 #ifndef ESTRPIPE
 #define ESTRPIPE 86
 #endif
+#ifndef EBADFD
+#define EBADFD 77   /* Linux's value; ALSA returns it for a bad stream state */
+#endif
