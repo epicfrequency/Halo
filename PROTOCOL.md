@@ -413,6 +413,42 @@ exact commit moment; now it just says so. Daemons may keep a conservative
 idle/drain inference **only as a fallback** for senders that never send
 `SWITCH_TO_PENDING`.
 
+#### Do not make the promotion depend on the message alone
+
+A receiver that waits *only* for `SWITCH_TO_PENDING` before promoting can
+deadlock, because control and audio share one TCP stream and audio can fill
+the pipe ahead of the control message:
+
+1. the receiver's pending buffer fills with the next track's audio;
+2. it stops reading the socket to apply backpressure — but the reading side
+   is also what delivers `SWITCH_TO_PENDING`;
+3. the pending buffer is only drained *after* a promotion, which is the
+   thing waiting on the undelivered message.
+
+Nothing breaks the cycle except a timeout, so every boundary stalls for its
+full length. It is strongly rate-dependent: DSD fills a buffer fast enough
+to hit it on essentially every track, while PCM at ordinary rates usually
+slips through, which makes it read like a DSD-specific bug rather than a
+structural one.
+
+The way out does not need a timeout. **TCP ordering already proves the old
+track is finished**: the sender emits all of the old stream's audio, then
+the preannounce, then the new stream's audio, in that order on one
+connection — so the presence of *any* pending-stream byte means every
+old-stream byte has already arrived. A receiver may therefore promote as
+soon as the active buffer is empty *and* the pending buffer is non-empty,
+and this is sound rather than a guess: an empty active buffer on its own is
+ambiguous (a mid-track network stall looks the same), but combined with
+pending data it is not.
+
+`SWITCH_TO_PENDING` remains the primary signal and the one that carries the
+sender's exact intent — this is an additional sufficient condition, not a
+replacement.
+
+This is one of the concrete costs of sharing a single stream between control
+and bulk data, and part of the motivation for the channel split in the v2
+proposal below.
+
 ### Cancelling a preannounce
 
 A preannounce isn't a commitment — the sender can legitimately abandon it

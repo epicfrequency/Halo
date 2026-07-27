@@ -33,7 +33,20 @@
 #include "alsa_output.h"
 #include "net_io.h"
 
-#define RING_CAPACITY (1u << 21) /* 2 MiB per ring; ~500ms+ of headroom even at DSD256 stereo */
+/* 16 MiB per ring (32 MiB for both), sized for jitter tolerance over Wi-Fi:
+ * roughly 23s at DSD64, 2.8s at DSD512, 30s at PCM 24/96. The old 2 MiB gave
+ * DSD512 only ~0.37s, which is thin for a wireless link.
+ *
+ * Sizing is deliberately *not* how the pending-ring deadlock is addressed —
+ * the sender queues several seconds ahead, so at DSD512 rates any fixed
+ * capacity can be filled, and a bigger ring would only make the stall rarer
+ * and harder to reproduce. The switch condition in alsa_writer_thread is
+ * what actually breaks the cycle. This is purely underrun headroom.
+ *
+ * The process mlocks its memory (halo_set_realtime_priority), so this is 32
+ * MiB of locked RAM — immaterial on a Pi 5, but worth knowing before
+ * raising it much further. */
+#define RING_CAPACITY (1u << 24)
 #define DEFAULT_PORT 5555
 
 /* Legacy-sender fallback only: how long the active stream's AUDIO_DATA may
@@ -185,6 +198,29 @@ static void *alsa_writer_thread(void *arg) {
             int do_switch = 0;
             if (st->pending_valid) {
                 if (st->switch_requested) {
+                    do_switch = 1;
+                } else if (halo_ring_used(&st->ring[1 - st->active_idx]) > 0) {
+                    /* Sound on its own, not a guess — and load-bearing,
+                     * because waiting for SWITCH_TO_PENDING here can
+                     * deadlock. The message shares one TCP stream with bulk
+                     * audio: once the pending ring fills, the network thread
+                     * blocks trying to write more into it, and it is the
+                     * same thread that would deliver SWITCH_TO_PENDING. The
+                     * pending ring is only drained *after* a switch, so
+                     * nothing breaks the cycle except the fallback timeout
+                     * below — which is why every DSD gapless boundary stalled
+                     * for the length of that timeout while PCM, with a far
+                     * lower byte rate, usually squeaked through.
+                     *
+                     * TCP ordering is what makes this safe. The sender emits
+                     * all of the old stream's audio, then the preannounce,
+                     * then the new stream's audio, in that order on one
+                     * connection. So the presence of *any* pending-stream
+                     * byte proves every old-stream byte already arrived, and
+                     * an empty active ring therefore means the old track is
+                     * genuinely finished — not the mid-track network stall
+                     * that an empty ring alone could also mean. ALSA's own
+                     * buffered tail is untouched and still plays out. */
                     do_switch = 1;
                 } else {
                     uint64_t last = atomic_load(&st->last_active_data_ns);
@@ -386,7 +422,10 @@ static void report_status(halo_state_t *st, int force) {
          * print-on-change filter below. */
         ring_pct = (ring_pct / 5) * 5;
 
-        unsigned int rate = atomic_load(&st->active_alsa_rate);
+        /* frames_written counts wire ticks, so the divisor is the wire
+         * sample_rate — not the ALSA frame rate, which for DSD_U32 is a
+         * quarter of it and made the elapsed time run four times fast. */
+        unsigned int rate = fmt.sample_rate;
         uint64_t frames = atomic_load(&st->frames_written);
         unsigned secs = rate ? (unsigned)(frames / rate) : 0u;
 
@@ -418,7 +457,11 @@ static void report_status(halo_state_t *st, int force) {
     } else {
         char fmt_desc[96];
         describe_format(&fmt, fmt_desc, sizeof(fmt_desc));
+        /* Two different rates on purpose: alsa_rate is reported as-is for
+         * anyone debugging the device side, while position_seconds must use
+         * the wire rate, since frames_written counts wire ticks. */
         unsigned int rate = atomic_load(&st->active_alsa_rate);
+        unsigned int wire_rate = fmt.sample_rate;
         uint64_t frames = atomic_load(&st->frames_written);
         size_t used = halo_ring_used(&st->ring[idx]);
         n = snprintf(json, sizeof(json),
@@ -430,7 +473,7 @@ static void report_status(halo_state_t *st, int force) {
                      atomic_load(&st->paused) ? "paused" : "playing",
                      fmt_desc, fid, fmt.is_dsd, fmt.channels, fmt.sample_rate,
                      rate, (unsigned long long)frames,
-                     rate ? (double)frames / (double)rate : 0.0,
+                     wire_rate ? (double)frames / (double)wire_rate : 0.0,
                      (unsigned)((used * 100) / RING_CAPACITY),
                      (unsigned long long)atomic_load(&st->underrun_count));
     }
