@@ -160,12 +160,29 @@ int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
         }
     }
     if (any_dsd) {
-        /* Rough rate-based mask: DSD64=2.8224MHz, 128=5.6448, 256=11.2896 */
-        unsigned int rmin = 0;
-        snd_pcm_hw_params_get_rate_min(params, &rmin, NULL);
-        if (rate_max >= 11289600 / 4) dsd_mask |= (1u << 2); /* DSD256 (rate expressed post /4 for U32) */
-        if (rate_max >= 5644800 / 4)  dsd_mask |= (1u << 1); /* DSD128 */
-        if (rate_max >= 2822400 / 4)  dsd_mask |= (1u << 0); /* DSD64 */
+        /* Which DSD multiples fit under the device's max rate.
+         *
+         * ALSA states a DSD stream's rate in *frames*, and one frame carries
+         * 8 DSD bits per byte of the packing width: DSD_U32 therefore runs at
+         * bit_rate/32, DSD_U16 at bit_rate/16, DSD_U8 at bit_rate/8. The
+         * previous fixed "/4" matched none of those and understated every
+         * device — a DAC reporting rate_max 768000 (good for DSD512 in U32
+         * packing) came back advertising DSD64 only. Derive the divisor from
+         * the packing actually detected above. */
+        size_t bytes_per_frame = dsd_alsa_bytes_per_channel_frame();
+        unsigned int bits_per_frame = (unsigned int)(bytes_per_frame * 8);
+        static const struct { unsigned long bit_rate; unsigned bit; } dsd_rates[] = {
+            { 2822400u,  0 }, /* DSD64  */
+            { 5644800u,  1 }, /* DSD128 */
+            { 11289600u, 2 }, /* DSD256 */
+            { 22579200u, 3 }, /* DSD512 */
+        };
+        for (size_t i = 0; i < sizeof(dsd_rates) / sizeof(dsd_rates[0]); i++) {
+            if (bits_per_frame > 0 &&
+                rate_max >= (unsigned int)(dsd_rates[i].bit_rate / bits_per_frame)) {
+                dsd_mask |= (1u << dsd_rates[i].bit);
+            }
+        }
     }
     caps_out->supports_native_dsd = (uint8_t)any_dsd;
     caps_out->supports_dop = 0; /* not implemented yet, see README */
