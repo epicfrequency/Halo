@@ -21,6 +21,7 @@ typedef int snd_pcm_stream_t;
 #define SND_PCM_ACCESS_MMAP_INTERLEAVED 0
 #define SND_PCM_FORMAT_S16_LE 2
 #define SND_PCM_FORMAT_S24_LE 6
+#define SND_PCM_FORMAT_S24_3LE 32  /* real ALSA's value; 3-byte packed */
 #define SND_PCM_FORMAT_S32_LE 10
 #define SND_PCM_FORMAT_DSD_U8 48
 #define SND_PCM_FORMAT_DSD_U16_LE 49

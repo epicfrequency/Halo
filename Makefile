@@ -43,6 +43,10 @@ CHECK_RUNTIME = /tmp/halo-selftest
 CHECK_PORT = 5601
 
 check:
+	@echo "==> Running sample-packing tests"
+	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
+		tools/packing_test.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-packing-test
+	@/tmp/halo-packing-test
 	@echo "==> Building against the ALSA stub"
 	@rm -rf $(CHECK_RUNTIME) && mkdir -p $(CHECK_RUNTIME)
 	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread \

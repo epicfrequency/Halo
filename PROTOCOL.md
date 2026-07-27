@@ -71,6 +71,56 @@ the conversion's *output*, so `FORMAT` correctly says PCM — the fact that it
 began as DSD is metadata, not format, and travels in `METADATA.source` so a
 display can show "DSD64 → PCM 352.8k" rather than just "PCM 352.8k".
 
+### Byte layout on the wire
+
+The layout below is fixed and does **not** vary with the receiving DAC. A
+receiver whose hardware wants a different arrangement is responsible for
+repacking; a sender must never adapt its layout to the device.
+
+**PCM** — little-endian signed samples, channel-interleaved, one frame per
+`sample_rate` tick. 24-bit is *three* bytes per sample, packed with no
+padding — not a 24-in-32 container. A receiver whose device only offers a
+32-bit format widens the samples itself, left-justified.
+
+**Native DSD** — chronological DSD bytes, MSB-first within each byte,
+interleaved **two bytes per channel**:
+
+```
+[c0.t0 c0.t1] [c1.t0 c1.t1] [c0.t2 c0.t3] [c1.t2 c1.t3] ...
+```
+
+which is byte-for-byte ALSA's `DSD_U16_BE`. It was chosen because DSD
+sources are naturally 16-bit-grouped and because DoP needs pairs anyway, so
+no sender has to regroup.
+
+The receiver regroups from here. ALSA's other DSD formats hold the same
+bytes differently: `DSD_U32_*` gathers four chronological bytes per channel
+into one frame, and the `_LE` variants store each group in reverse memory
+order (the earliest sample sits in the most significant byte either way).
+Handing wire bytes to a `DSD_U32` device unrepacked is a silent failure
+worth naming, because it does not sound like a layout bug: the device opens,
+the clock keeps up, and the position advances normally, but each frame
+swallows the next channel's pair as its own second half and the channels
+smear into noise — easily misread as a bit-order or DAC-compatibility
+problem.
+
+### The unit `sample_rate` and `frames_written` count
+
+Both are in **wire ticks**, and a tick is not always an ALSA frame:
+
+| `is_dsd` | one tick | `sample_rate` |
+|---|---|---|
+| 0 (PCM) | one sample frame | sample rate in Hz |
+| 1 (native DSD) | **one byte per channel** | DSD bit rate ÷ 8 |
+| 2 (DoP) | one 32-bit container per channel | DSD bit rate ÷ 16 |
+
+For native DSD a tick is deliberately one byte per channel regardless of how
+the device packs DSD, so that `sample_rate = bit_rate/8` and the position
+arithmetic agree on both sides. A receiver that reports ALSA frames instead
+under-reports elapsed time by its packing width — a factor of four under
+`DSD_U32`, which reads as a stalled or half-speed position rather than as a
+unit mismatch.
+
 **No compressed audio ever reaches this protocol.** Not FLAC, ALAC, MP3,
 DST or anything else — the sender decodes first, always, and HALO carries
 only the finished samples. The daemon owns no decoder and cannot acquire

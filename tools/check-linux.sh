@@ -34,6 +34,13 @@ docker run --rm -v "$WORK":/src -w /src "$IMAGE" bash -c "
   echo \"    gcc  \$(gcc -dumpversion) / arch \$(uname -m) / libasound \$(dpkg-query -f '\${Version}' -W libasound2-dev)\"
   make clean >/dev/null 2>&1 || true
   make CFLAGS='-O2 -Wall -Wextra -Werror -std=c11 -pthread'
+  # The packing tests matter more here than under the stub: the real headers
+  # are where SND_PCM_FORMAT_S24_3LE and the DSD_U* enums have their true
+  # values, and a layout assertion is only meaningful against those.
+  echo '==> Sample-packing tests against real ALSA headers'
+  gcc -O2 -Wall -Wextra -Werror -std=c11 -pthread -I src \\
+      tools/packing_test.c -lasound -o /tmp/halo-packing-test
+  /tmp/halo-packing-test
 
   mkdir -p /run/halo-daemon
   # hw:99,0 does not exist anywhere, so every open fails — which is exactly

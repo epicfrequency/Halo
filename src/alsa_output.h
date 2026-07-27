@@ -18,6 +18,15 @@ typedef struct {
     int is_open;
     snd_pcm_uframes_t period_size;
     snd_pcm_uframes_t buffer_size_frames;
+    /* What the device actually accepted, which is not always the natural
+     * mapping of fmt.bits_per_sample: plenty of USB DACs advertise only
+     * S32_LE and no 24-bit format at all. When that happens the samples are
+     * widened on the way out (see widen_to_s32) rather than the track being
+     * refused. */
+    snd_pcm_format_t hw_format;
+    int widen_to_s32;
+    uint8_t *convert_buf;
+    size_t convert_buf_bytes;
 } halo_alsa_ctx_t;
 
 /* Queries the device without fixing a format, to build the CAPS message.
@@ -51,9 +60,16 @@ int halo_alsa_drain(halo_alsa_ctx_t *ctx);
  * seek/FLUSH). */
 int halo_alsa_drop_and_prepare(halo_alsa_ctx_t *ctx);
 
-/* Bytes-per-frame for the given format, accounting for PCM vs native DSD
- * vs DoP packing. */
+/* Bytes per *wire tick* — the unit the protocol counts in, which is what
+ * sample_rate and POSITION.frames_written are both expressed in. For PCM a
+ * tick is a sample frame; for native DSD it is one byte per channel,
+ * independent of how the device packs DSD. */
 size_t halo_format_frame_size(const struct halo_format *fmt);
+
+/* How many wire ticks make up one ALSA frame. 1 for PCM; for native DSD it
+ * is the device's packing width (4 under DSD_U32, 2 under DSD_U16, 1 under
+ * DSD_U8), so callers sizing reads against period_size can scale correctly. */
+size_t halo_alsa_wire_ticks_per_frame(const struct halo_format *fmt);
 
 /* The DSD packing the attached device actually accepts, discovered by
  * halo_alsa_query_caps. Falls back to the compile-time default until then. */

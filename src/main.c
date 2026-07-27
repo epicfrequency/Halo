@@ -120,6 +120,13 @@ static void *alsa_writer_thread(void *arg) {
         if (!stream_open) { usleep(5000); continue; }
 
         size_t frame_size = halo_format_frame_size(&fmt);
+        /* Reads must land on an ALSA *frame* boundary, which for native DSD
+         * spans several wire ticks (four under DSD_U32). Aligning only to a
+         * tick would hand halo_alsa_write a partial frame, and the leftover
+         * ticks would be dropped rather than carried, shifting every channel
+         * by a byte from that point on. */
+        size_t ticks_per_frame = halo_alsa_wire_ticks_per_frame(&fmt);
+        size_t align_bytes = frame_size * ticks_per_frame;
         size_t used = halo_ring_used(&st->ring[idx]);
         /* Only whole frames are ever eligible to be pulled out of the ring
          * — see the "frame-alignment truncation bug" note in the design
@@ -127,7 +134,7 @@ static void *alsa_writer_thread(void *arg) {
          * bytes stay put and wait for more data to complete the frame,
          * rather than being silently read-and-dropped, which used to
          * permanently misalign every sample after it. */
-        size_t usable_bytes = used - (used % frame_size);
+        size_t usable_bytes = used - (used % align_bytes);
 
         if (usable_bytes == 0) {
             /* Nothing (whole-frame) buffered for the active stream right
@@ -200,14 +207,15 @@ static void *alsa_writer_thread(void *arg) {
         }
 
         size_t want = st->alsa.period_size > 0
-                          ? (size_t)st->alsa.period_size * frame_size
+                          ? (size_t)st->alsa.period_size * align_bytes
                           : buf_bytes;
         if (want > buf_bytes) want = buf_bytes;
         if (want > usable_bytes) want = usable_bytes; /* never pull a partial trailing frame */
         size_t got = halo_ring_read(&st->ring[idx], scratch, want);
         if (got == 0) continue;
 
-        snd_pcm_uframes_t nframes = got / frame_size; /* exact now — got is frame-aligned by construction */
+        /* Wire ticks, not ALSA frames — halo_alsa_write does that conversion. */
+        snd_pcm_uframes_t nframes = got / frame_size;
         if (nframes == 0) continue;
 
         int underrun = 0;
