@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — install halo-daemon as a systemd service and advertise it
-# over Avahi/Bonjour. Safe to re-run to upgrade an existing install.
+# install.sh — one step from a fresh machine to a running endpoint: installs
+# what's missing, builds, picks the DAC, and registers the service. Safe to
+# re-run to upgrade an existing install.
+#
+# There is deliberately no separate build script and no build-time tuning.
+# The DSD packing a DAC wants (BE/LE, 8/16/32-bit) is discovered at runtime,
+# so one binary drives any device — which is what makes it sane to build this
+# on one machine and copy it to another.
 #
 # The one thing this exists to get right: the ALSA device and the TCP port
 # appear in *two* files (the systemd unit and the Avahi service). Editing
@@ -13,16 +19,18 @@ cd "$(dirname "$0")"
 DEVICE=""
 PORT="5555"
 ASSUME_YES=0
+SKIP_DEPS=0
 
 usage() {
     cat <<USAGE
-Usage: sudo ./install.sh [--device hw:CARD,DEV] [--port N] [--yes]
+Usage: sudo ./install.sh [--device hw:CARD,DEV] [--port N] [--yes] [--skip-deps]
 
   --device   ALSA device, e.g. hw:1,0. Omit to choose interactively.
              Use hw: — not plughw:/default: — or ALSA silently converts
              formats and bit-perfect output is gone.
   --port     TCP port to listen on (default 5555).
   --yes      Don't prompt; requires --device.
+  --skip-deps  Fail instead of installing missing packages via apt.
 USAGE
 }
 
@@ -31,6 +39,7 @@ while [ $# -gt 0 ]; do
         --device) DEVICE="${2:-}"; shift 2 ;;
         --port)   PORT="${2:-}";   shift 2 ;;
         --yes)    ASSUME_YES=1;    shift ;;
+        --skip-deps) SKIP_DEPS=1;  shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -66,13 +75,58 @@ enumerate_playback_devices() {
 [ "$(id -u)" -eq 0 ] || { echo "Must run as root: sudo ./install.sh (or directly, if already root)." >&2; exit 1; }
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "--port must be numeric, got '$PORT'" >&2; exit 1; }
 
-# ---------------------------------------------------------------- binary
-if [ ! -x ./halo-daemon ]; then
-    echo "==> ./halo-daemon not found, building first"
-    # build.sh refuses to run as root-only cleanly? It doesn't care, but the
-    # object files end up root-owned; that's fine for a one-shot install.
-    ./build.sh
-fi
+# ------------------------------------------------------------ dependencies
+# Installed rather than merely reported. A missing compiler or ALSA header is
+# not a decision the person running this needs to be consulted about, and
+# hand-copying an apt line out of an error message is the step where most
+# first installs stall.
+ensure_dependencies() {
+    local missing=()
+    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || missing+=(build-essential)
+    command -v make >/dev/null 2>&1 || missing+=(build-essential)
+    [ -f /usr/include/alsa/asoundlib.h ] || missing+=(libasound2-dev)
+    # Discovery is how the sender finds this machine without anyone typing an
+    # IP address, so it counts as a dependency, not an optional extra.
+    command -v avahi-daemon >/dev/null 2>&1 || missing+=(avahi-daemon)
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        echo "==> Dependencies present"
+        return 0
+    fi
+
+    # De-duplicate (build-essential can be added twice).
+    local uniq=()
+    local pkg
+    for pkg in "${missing[@]}"; do
+        case " ${uniq[*]-} " in *" $pkg "*) ;; *) uniq+=("$pkg") ;; esac
+    done
+
+    if [ "$SKIP_DEPS" -eq 1 ]; then
+        echo "Missing: ${uniq[*]}" >&2
+        echo "Re-run without --skip-deps, or install them yourself." >&2
+        exit 1
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "Missing: ${uniq[*]}" >&2
+        echo "No apt-get here — install the equivalents for your distribution:" >&2
+        echo "  Fedora/RHEL:  dnf install gcc make alsa-lib-devel avahi" >&2
+        echo "  Arch:         pacman -S base-devel alsa-lib avahi" >&2
+        exit 1
+    fi
+
+    echo "==> Installing: ${uniq[*]}"
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${uniq[@]}"
+}
+
+ensure_dependencies
+
+# ---------------------------------------------------------------- build
+echo "==> Building"
+make clean >/dev/null 2>&1 || true
+make
+[ -x ./halo-daemon ] || { echo "Build produced no halo-daemon binary." >&2; exit 1; }
 
 # ---------------------------------------------------------------- device
 if [ -z "$DEVICE" ]; then
@@ -170,7 +224,16 @@ grep -q "^ExecStart=/usr/local/bin/halo-daemon ${DEVICE} ${PORT}$" \
 # OS ships Avahi; minimal images (DietPi in particular) do not. Without it
 # the endpoint is fully functional but simply never appears in the app, with
 # no error on either side, which is a miserable thing to diagnose.
-if ! systemctl list-unit-files 2>/dev/null | grep -q '^avahi-daemon\.service'; then
+# Checked two ways on purpose. `systemctl list-unit-files` can come back
+# without avahi for a moment right after apt has installed it — systemd is
+# still reloading — and a false "not installed" here sends the reader off
+# installing something they already have.
+avahi_present() {
+    command -v avahi-daemon >/dev/null 2>&1 && return 0
+    systemctl list-unit-files 2>/dev/null | grep -q '^avahi-daemon\.service' && return 0
+    return 1
+}
+if ! avahi_present; then
     AVAHI_MISSING=1
     echo
     echo "WARNING: avahi-daemon is not installed."
@@ -210,7 +273,7 @@ if systemctl is-active --quiet halo-daemon.service; then
         echo "    systemctl restart avahi-daemon"
     else
         echo "In Audio Lounge: Settings -> enable HALO, then pick"
-        echo "    \"HALO Audio Endpoint on $(hostname)\""
+        echo "    \"HALO Audio Transport on $(hostname)\""
     fi
 else
     echo "==> halo-daemon FAILED to start. Recent log:" >&2

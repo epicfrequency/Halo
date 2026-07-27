@@ -9,14 +9,24 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* Which physical ALSA DSD packing to use for native DSD frames on the
- * wire. U32_LE is what most modern async USB DAC drivers (XMOS/Amanero
- * based) expose. If `aplay --dump-hw-params -D hw:X,Y /dev/null` on your
- * actual Pi5 + DAC shows only DSD_U8 or DSD_U16_LE, change this and
- * recompile — see README.md. */
-#ifndef HALO_DSD_ALSA_FORMAT
-#define HALO_DSD_ALSA_FORMAT SND_PCM_FORMAT_DSD_U32_LE
-#endif
+/* The DSD packing a device wants is discovered at runtime, never chosen at
+ * build time. Different DACs disagree (the Gustard here takes DSD_U32_BE
+ * only; plenty of XMOS/Amanero designs take DSD_U32_LE; some older ones only
+ * DSD_U8), and a compile-time choice means one binary per DAC — which makes
+ * a prebuilt package useless and silently mis-plays if the wrong one is
+ * deployed. This is only the starting guess for the probe order. */
+#define HALO_DSD_FIRST_GUESS SND_PCM_FORMAT_DSD_U32_BE
+
+/* Every packing this daemon can drive, most capable first. DSD_U32 reaches
+ * the highest bit rates for a given ALSA frame rate, so it is preferred when
+ * the device accepts more than one. */
+static const snd_pcm_format_t k_dsd_candidates[] = {
+    SND_PCM_FORMAT_DSD_U32_BE, SND_PCM_FORMAT_DSD_U32_LE,
+    SND_PCM_FORMAT_DSD_U16_BE, SND_PCM_FORMAT_DSD_U16_LE,
+    SND_PCM_FORMAT_DSD_U8,
+};
+#define HALO_DSD_CANDIDATE_COUNT \
+    (sizeof(k_dsd_candidates) / sizeof(k_dsd_candidates[0]))
 
 static size_t dsd_alsa_bytes_per_channel_frame(void) {
     switch (halo_alsa_dsd_format()) {
@@ -71,7 +81,7 @@ unsigned int halo_alsa_current_rate(const halo_alsa_ctx_t *ctx) {
 /* Set by halo_alsa_query_caps from what the device actually accepted; the
  * compile-time HALO_DSD_ALSA_FORMAT is only the fallback for when probing
  * never ran or found nothing. */
-static snd_pcm_format_t g_detected_dsd_format = HALO_DSD_ALSA_FORMAT;
+static snd_pcm_format_t g_detected_dsd_format = HALO_DSD_FIRST_GUESS;
 static int g_dsd_format_detected = 0;
 
 void halo_alsa_set_detected_dsd_format(snd_pcm_format_t fmt) {
@@ -80,7 +90,7 @@ void halo_alsa_set_detected_dsd_format(snd_pcm_format_t fmt) {
 }
 
 snd_pcm_format_t halo_alsa_dsd_format(void) {
-    return g_dsd_format_detected ? g_detected_dsd_format : (snd_pcm_format_t)HALO_DSD_ALSA_FORMAT;
+    return g_dsd_format_detected ? g_detected_dsd_format : (snd_pcm_format_t)HALO_DSD_FIRST_GUESS;
 }
 
 static snd_pcm_format_t pcm_format_for(const struct halo_format *fmt) {
@@ -168,17 +178,12 @@ int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
      * message blaming its own settings. Whichever the device accepts is
      * remembered and used for playback, so the format follows the hardware
      * instead of a compile-time guess. */
-    static const snd_pcm_format_t dsd_candidates[] = {
-        SND_PCM_FORMAT_DSD_U32_BE, SND_PCM_FORMAT_DSD_U32_LE,
-        SND_PCM_FORMAT_DSD_U16_BE, SND_PCM_FORMAT_DSD_U16_LE,
-        SND_PCM_FORMAT_DSD_U8,
-    };
-    for (size_t i = 0; i < sizeof(dsd_candidates) / sizeof(dsd_candidates[0]); i++) {
-        if (snd_pcm_hw_params_test_format(pcm, params, dsd_candidates[i]) == 0) {
+    for (size_t i = 0; i < HALO_DSD_CANDIDATE_COUNT; i++) {
+        if (snd_pcm_hw_params_test_format(pcm, params, k_dsd_candidates[i]) == 0) {
             any_dsd = 1;
-            halo_alsa_set_detected_dsd_format(dsd_candidates[i]);
+            halo_alsa_set_detected_dsd_format(k_dsd_candidates[i]);
             fprintf(stderr, "halo: device accepts native DSD as %s\n",
-                    snd_pcm_format_name(dsd_candidates[i]));
+                    snd_pcm_format_name(k_dsd_candidates[i]));
             break;
         }
     }
@@ -215,8 +220,13 @@ int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
     return 0;
 }
 
-static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
-                        const struct halo_format *fmt) {
+/* One attempt with one specific ALSA format. Split out from open_locked so
+ * native DSD can walk its candidate packings here rather than trusting a
+ * single guess: the rate depends on the packing width, so a candidate cannot
+ * be evaluated without going through the whole sequence. */
+static int open_with_format(halo_alsa_ctx_t *ctx, const char *device_name,
+                             const struct halo_format *fmt,
+                             snd_pcm_format_t forced_dsd_format, int quiet) {
     int err;
     snd_pcm_hw_params_t *params = NULL;
 
@@ -250,7 +260,14 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
      * nothing, and the DAC ignores the low byte. Order matters — the natural
      * format is always tried first so the common case still writes the bytes
      * through untouched. */
-    snd_pcm_format_t alsa_fmt = pcm_format_for(fmt);
+    snd_pcm_format_t alsa_fmt = fmt->is_dsd == HALO_FMT_DSD_NATIVE
+                                    ? forced_dsd_format
+                                    : pcm_format_for(fmt);
+    /* The rate below is derived from the packing width, so the candidate has
+     * to be the active one before alsa_rate_for() runs. */
+    if (fmt->is_dsd == HALO_FMT_DSD_NATIVE) {
+        halo_alsa_set_detected_dsd_format(forced_dsd_format);
+    }
     ctx->widen_to_s32 = 0;
     err = snd_pcm_hw_params_set_format(ctx->pcm, params, alsa_fmt);
     if (err < 0 && fmt->is_dsd == HALO_FMT_PCM &&
@@ -271,7 +288,7 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
         }
     }
     if (err < 0) {
-        fprintf(stderr, "halo: set_format(%s) failed: %s\n",
+        if (!quiet) fprintf(stderr, "halo: set_format(%s) failed: %s\n",
                 snd_pcm_format_name(alsa_fmt), snd_strerror(err));
         snd_pcm_close(ctx->pcm);
         ctx->pcm = NULL;
@@ -281,7 +298,7 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
 
     err = snd_pcm_hw_params_set_channels(ctx->pcm, params, fmt->channels);
     if (err < 0) {
-        fprintf(stderr, "halo: set_channels(%u) failed: %s\n", fmt->channels, snd_strerror(err));
+        if (!quiet) fprintf(stderr, "halo: set_channels(%u) failed: %s\n", fmt->channels, snd_strerror(err));
         snd_pcm_close(ctx->pcm);
         return -1;
     }
@@ -290,7 +307,7 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
     unsigned int actual_rate = rate;
     err = snd_pcm_hw_params_set_rate_near(ctx->pcm, params, &actual_rate, NULL);
     if (err < 0) {
-        fprintf(stderr, "halo: set_rate_near(%u) failed: %s\n", rate, snd_strerror(err));
+        if (!quiet) fprintf(stderr, "halo: set_rate_near(%u) failed: %s\n", rate, snd_strerror(err));
         snd_pcm_close(ctx->pcm);
         return -1;
     }
@@ -309,7 +326,7 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
 
     err = snd_pcm_hw_params(ctx->pcm, params);
     if (err < 0) {
-        fprintf(stderr, "halo: hw_params commit failed: %s\n", snd_strerror(err));
+        if (!quiet) fprintf(stderr, "halo: hw_params commit failed: %s\n", snd_strerror(err));
         snd_pcm_close(ctx->pcm);
         return -1;
     }
@@ -333,6 +350,37 @@ static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
             (unsigned long)ctx->period_size, (unsigned long)ctx->buffer_size_frames);
 
     return 0;
+}
+
+static int open_locked(halo_alsa_ctx_t *ctx, const char *device_name,
+                        const struct halo_format *fmt) {
+    if (fmt->is_dsd != HALO_FMT_DSD_NATIVE) {
+        return open_with_format(ctx, device_name, fmt, SND_PCM_FORMAT_UNKNOWN, 0);
+    }
+
+    /* Try the packing the probe found first, then the rest. Probing at HELLO
+     * can be wrong or can not have happened at all (device busy at the time),
+     * and a DSD packing that the device refuses is not a track the daemon
+     * should reject — it is a packing it should stop using. Doing the search
+     * here is what lets one binary drive any DAC. */
+    snd_pcm_format_t first = halo_alsa_dsd_format();
+    if (open_with_format(ctx, device_name, fmt, first, 1) == 0) return 0;
+
+    for (size_t i = 0; i < HALO_DSD_CANDIDATE_COUNT; i++) {
+        if (k_dsd_candidates[i] == first) continue;
+        if (open_with_format(ctx, device_name, fmt, k_dsd_candidates[i], 1) == 0) {
+            fprintf(stderr, "halo: %s was not accepted, using %s instead\n",
+                    snd_pcm_format_name(first),
+                    snd_pcm_format_name(k_dsd_candidates[i]));
+            return 0;
+        }
+    }
+
+    /* Nothing worked — repeat the preferred attempt loudly so the log says
+     * why, instead of only that "the format was rejected". */
+    fprintf(stderr, "halo: no DSD packing this device accepts; last attempt:\n");
+    halo_alsa_set_detected_dsd_format(first);
+    return open_with_format(ctx, device_name, fmt, first, 0);
 }
 
 int halo_alsa_open(halo_alsa_ctx_t *ctx, const char *device_name,

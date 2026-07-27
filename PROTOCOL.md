@@ -1,4 +1,4 @@
-# HALO Audio Endpoint Protocol v1
+# HALO Audio Transport Protocol v1
 
 ("HALO" = Hi-res Audio Loop Output — placeholder name, rename freely.)
 

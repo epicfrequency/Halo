@@ -1,4 +1,4 @@
-# halo-daemon
+# HALO Audio Transport
 
 Pi5-side receiver for a custom point-to-point hi-res/DSD audio protocol
 (codename HALO). One macOS sender (your player), one Pi5 + DAC endpoint,
@@ -43,14 +43,18 @@ It cannot catch what only real hardware shows: `hw_params` negotiation,
 whether the DAC really accepts native DSD, DSD bit order, or how it sounds.
 The stub says yes to everything.
 
-## Native DSD format (do not skip this)
+## Native DSD format (handled for you)
 
 Which ALSA format a DAC accepts native DSD as is a property of the device,
 and picking the wrong one is **not** a graceful failure — the byte order is
 reversed and you hear noise, with no error anywhere.
 
-`build.sh` reads it out of `/proc/asound/cardN/stream0` and compiles
-accordingly, so normally there is nothing to do. To check by hand:
+The daemon settles this at runtime, twice: it probes every packing it can
+drive when a sender connects, and if the one it picked turns out not to open,
+it walks the rest before giving up. Nothing is chosen at build time, so the
+same binary drives any DAC — build it once, copy it anywhere.
+
+To see what your device reports, if you're curious:
 
 ```
 cat /proc/asound/card0/stream0
@@ -62,12 +66,6 @@ cat /proc/asound/card0/stream0
     DSD raw: DOP=0, bitrev=0        <- DOP=0 means real native DSD;
                                        bitrev=0 means the driver passes bit
                                        order through unchanged
-```
-
-To override (multiple DACs, or the device was powered off during build):
-
-```
-make DSD_FORMAT=DSD_U32_BE
 ```
 
 A device that lists no `DSD_*` altset has no native DSD at all — use DoP or
@@ -115,11 +113,14 @@ checks for it and says so rather than letting you discover that the hard way.
 DietPi normally logs you in as root, so `./install.sh` works directly — `sudo`
 is only needed if you've set up a non-root user.
 
-## Quick start (scripted)
+## Quick start
+
+One command from a fresh machine to a running endpoint — it installs whatever
+is missing (compiler, ALSA headers, Avahi), builds, lists your DACs so you can
+pick one, and registers the service:
 
 ```
-./build.sh                 # checks deps, compiles
-sudo ./install.sh          # interactive: lists your DACs, then installs the service
+sudo ./install.sh
 ```
 
 `install.sh` also takes flags for unattended use:
@@ -248,7 +249,7 @@ browser.browseResultsChangedHandler = { results, _ in
             }
         }
         connection.start(queue: .main)
-        // In practice: surface `name` (e.g. "HALO Audio Endpoint on raspberrypi")
+        // In practice: surface `name` (e.g. "HALO Audio Transport on raspberrypi")
         // in a picker UI rather than auto-connecting to the first result —
         // there's nothing stopping more than one halo-daemon showing up on
         // a LAN, discovery just answers "which one," playback is still
@@ -266,10 +267,6 @@ on real hardware to confirm it actually announces.
 
 ## Things you will likely need to tune per-DAC
 
-- **`HALO_DSD_ALSA_FORMAT`** in `src/alsa_output.c`: hardcoded to
-  `SND_PCM_FORMAT_DSD_U32_LE`, which is what most XMOS/Amanero-based async
-  USB DAC drivers expose. If `--dump-hw-params` shows only `DSD_U8` or
-  `DSD_U16_LE` for your actual hardware, change the `#define` and rebuild.
 - **Buffer/period sizing** in `open_locked()` (`src/alsa_output.c`):
   currently targets a 500ms ALSA buffer / 8 periods. This is a starting
   point for "never underrun on a home LAN," not a measured optimum — once

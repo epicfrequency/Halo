@@ -8,10 +8,7 @@ CFLAGS ?= -O2 -Wall -Wextra -std=c11 -pthread
 # reversed and you hear noise. Default matches the most common XMOS
 # firmware; override when your DAC says otherwise:
 #
-#     make DSD_FORMAT=DSD_U32_BE
 #
-DSD_FORMAT ?= DSD_U32_LE
-CFLAGS += -DHALO_DSD_ALSA_FORMAT=SND_PCM_FORMAT_$(DSD_FORMAT)
 LDFLAGS ?= -lasound -pthread
 
 SRC = src/main.c src/alsa_output.c

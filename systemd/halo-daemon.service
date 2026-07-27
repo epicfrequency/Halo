@@ -1,5 +1,5 @@
 [Unit]
-Description=HALO audio endpoint daemon (hi-res PCM/DSD receiver)
+Description=HALO Audio Transport (hi-res PCM/DSD network audio receiver)
 # sound.target exists on most distros incl. Raspberry Pi OS; harmless if
 # it doesn't, systemd just treats it as an ordering-only dependency.
 After=network-online.target sound.target
