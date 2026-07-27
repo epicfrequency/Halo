@@ -38,8 +38,15 @@ RuntimeDirectoryMode=0755
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-# needs write access to /dev/snd/* despite ProtectSystem=strict:
-DeviceAllow=/dev/snd rw
+# Sound device access. `char-alsa` is systemd's device-class name for ALSA
+# character devices — NOT a path. Writing `DeviceAllow=/dev/snd rw` looks
+# right but silently breaks everything: /dev/snd is a directory rather than
+# a device node, so the rule matches nothing, and merely *having* a
+# DeviceAllow= line switches the unit to whitelist mode. The result is that
+# no sound device is permitted at all and every snd_pcm_open fails with
+# ENOENT — while the same command run by hand as root works fine, which
+# makes it look like an application bug rather than a sandbox one.
+DeviceAllow=char-alsa rw
 PrivateDevices=no
 
 [Install]

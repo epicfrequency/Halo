@@ -55,6 +55,11 @@ int halo_alsa_drop_and_prepare(halo_alsa_ctx_t *ctx);
  * vs DoP packing. */
 size_t halo_format_frame_size(const struct halo_format *fmt);
 
+/* The DSD packing the attached device actually accepts, discovered by
+ * halo_alsa_query_caps. Falls back to the compile-time default until then. */
+snd_pcm_format_t halo_alsa_dsd_format(void);
+void halo_alsa_set_detected_dsd_format(snd_pcm_format_t fmt);
+
 /* ALSA frame rate currently configured (0 if closed). This is *not* the
  * wire `sample_rate` — for native DSD the wire value is a per-channel byte
  * rate and the ALSA rate depends on the DSD packing width. Exposed so the

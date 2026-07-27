@@ -448,7 +448,27 @@ static void send_format_rejected(halo_state_t *st, uint32_t format_id, uint32_t 
 
 static void handle_hello(halo_state_t *st) {
     struct halo_caps caps;
-    halo_alsa_query_caps(st->alsa_device, &caps);
+    if (halo_alsa_query_caps(st->alsa_device, &caps) != 0) {
+        /* Probing failed — most often because something else holds the
+         * device (another player mid-playback), or it was unplugged.
+         *
+         * The old code ignored this and sent the all-zero struct, which
+         * says "supports nothing": the sender then refused *every* track,
+         * PCM included, with a message blaming its own DSD setting. That is
+         * both wrong and unactionable. Advertise a permissive fallback
+         * instead and let the real open decide — a format that genuinely
+         * can't be played now answers FORMAT_REJECTED with a reason, which
+         * is a truthful and specific failure rather than a blanket one. */
+        fprintf(stderr, "halo: WARNING — could not probe %s (device busy or absent). "
+                        "Advertising permissive capabilities; individual formats will be "
+                        "rejected at open time if unsupported.\n", st->alsa_device);
+        memset(&caps, 0, sizeof(caps));
+        caps.max_sample_rate_pcm = 768000;
+        caps.max_bits_per_sample = 32;
+        caps.max_channels = 2;
+        caps.supports_native_dsd = 0; /* unknown: don't claim what we couldn't verify */
+        caps.supported_dsd_rates_mask = 0;
+    }
     /* Advertise what this build actually implements, so a sender can tell
      * us apart from an original v1 daemon (which sends a 16-byte CAPS with
      * no flags word at all, and must keep working). */

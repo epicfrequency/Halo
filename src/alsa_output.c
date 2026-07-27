@@ -18,7 +18,7 @@
 #endif
 
 static size_t dsd_alsa_bytes_per_channel_frame(void) {
-    switch (HALO_DSD_ALSA_FORMAT) {
+    switch (halo_alsa_dsd_format()) {
         case SND_PCM_FORMAT_DSD_U8:     return 1;
         case SND_PCM_FORMAT_DSD_U16_LE:
         case SND_PCM_FORMAT_DSD_U16_BE: return 2;
@@ -52,8 +52,23 @@ unsigned int halo_alsa_current_rate(const halo_alsa_ctx_t *ctx) {
     return ctx->is_open ? alsa_rate_for(&ctx->fmt) : 0u;
 }
 
+/* Set by halo_alsa_query_caps from what the device actually accepted; the
+ * compile-time HALO_DSD_ALSA_FORMAT is only the fallback for when probing
+ * never ran or found nothing. */
+static snd_pcm_format_t g_detected_dsd_format = HALO_DSD_ALSA_FORMAT;
+static int g_dsd_format_detected = 0;
+
+void halo_alsa_set_detected_dsd_format(snd_pcm_format_t fmt) {
+    g_detected_dsd_format = fmt;
+    g_dsd_format_detected = 1;
+}
+
+snd_pcm_format_t halo_alsa_dsd_format(void) {
+    return g_dsd_format_detected ? g_detected_dsd_format : (snd_pcm_format_t)HALO_DSD_ALSA_FORMAT;
+}
+
 static snd_pcm_format_t pcm_format_for(const struct halo_format *fmt) {
-    if (fmt->is_dsd == HALO_FMT_DSD_NATIVE) return HALO_DSD_ALSA_FORMAT;
+    if (fmt->is_dsd == HALO_FMT_DSD_NATIVE) return halo_alsa_dsd_format();
     if (fmt->is_dsd == HALO_FMT_DSD_DOP)    return SND_PCM_FORMAT_S32_LE;
     switch (fmt->bits_per_sample) {
         case 16: return SND_PCM_FORMAT_S16_LE;
@@ -123,14 +138,28 @@ int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
      * `aplay --dump-hw-params` reality on your actual hardware. */
     uint32_t dsd_mask = 0;
     int any_dsd = 0;
-    struct { snd_pcm_format_t fmt; int bit; } dsd_probe[] = {
-        { SND_PCM_FORMAT_DSD_U32_LE, -1 }, /* rate-dependent, checked below */
+    /* Probe every DSD packing ALSA defines, not just the little-endian ones.
+     * XMOS-based DACs (Gustard, Topping, many others) commonly expose only
+     * DSD_U32_BE, and testing just the LE variants made those report "no
+     * native DSD at all" — the sender then refused every DSD track with a
+     * message blaming its own settings. Whichever the device accepts is
+     * remembered and used for playback, so the format follows the hardware
+     * instead of a compile-time guess. */
+    static const snd_pcm_format_t dsd_candidates[] = {
+        SND_PCM_FORMAT_DSD_U32_BE, SND_PCM_FORMAT_DSD_U32_LE,
+        SND_PCM_FORMAT_DSD_U16_BE, SND_PCM_FORMAT_DSD_U16_LE,
+        SND_PCM_FORMAT_DSD_U8,
     };
-    (void)dsd_probe;
-    if (snd_pcm_hw_params_test_format(pcm, params, SND_PCM_FORMAT_DSD_U32_LE) == 0 ||
-        snd_pcm_hw_params_test_format(pcm, params, SND_PCM_FORMAT_DSD_U16_LE) == 0 ||
-        snd_pcm_hw_params_test_format(pcm, params, SND_PCM_FORMAT_DSD_U8) == 0) {
-        any_dsd = 1;
+    for (size_t i = 0; i < sizeof(dsd_candidates) / sizeof(dsd_candidates[0]); i++) {
+        if (snd_pcm_hw_params_test_format(pcm, params, dsd_candidates[i]) == 0) {
+            any_dsd = 1;
+            halo_alsa_set_detected_dsd_format(dsd_candidates[i]);
+            fprintf(stderr, "halo: device accepts native DSD as %s\n",
+                    snd_pcm_format_name(dsd_candidates[i]));
+            break;
+        }
+    }
+    if (any_dsd) {
         /* Rough rate-based mask: DSD64=2.8224MHz, 128=5.6448, 256=11.2896 */
         unsigned int rmin = 0;
         snd_pcm_hw_params_get_rate_min(params, &rmin, NULL);
