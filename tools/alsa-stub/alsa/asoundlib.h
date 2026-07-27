@@ -57,6 +57,9 @@ int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *params, unsign
 int snd_pcm_set_chmap(snd_pcm_t *pcm, const snd_pcm_chmap_t *map);
 const char *snd_pcm_format_name(snd_pcm_format_t format);
 int snd_pcm_nonblock(snd_pcm_t *p, int nonblock);
+typedef int snd_pcm_state_t;
+#define SND_PCM_STATE_RUNNING 3
+snd_pcm_state_t snd_pcm_state(snd_pcm_t *p);
 const char *snd_strerror(int errnum);
 
 /* Linux-only errno values ALSA callers check for; absent on macOS. */

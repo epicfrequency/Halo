@@ -34,6 +34,8 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, snd_pcm_stream_t s, int m) {
 int snd_pcm_close(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_prepare(snd_pcm_t *p) { p->epoch++; p->state = STUB_PREPARED; return 0; }
 int snd_pcm_nonblock(snd_pcm_t *p, int nonblock) { (void)p; (void)nonblock; return 0; }
+/* RUNNING once anything has been written, matching the state machine above. */
+snd_pcm_state_t snd_pcm_state(snd_pcm_t *p) { return p->state == STUB_RUNNING ? SND_PCM_STATE_RUNNING : 0; }
 int snd_pcm_drain(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_drop(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_resume(snd_pcm_t *p) { p->epoch++; p->state = STUB_PREPARED; return 0; }

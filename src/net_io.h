@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <pthread.h>
 #include "protocol.h"
@@ -29,6 +30,15 @@
  * the connection is treated as dead. Generous: a busy sender pausing mid
  * message for a few seconds is normal, one doing it for a minute is not. */
 #define HALO_STALL_LIMIT_SECONDS 60
+
+/* Set by the shutdown signal handler. The idle wait below is unbounded on
+ * purpose — sitting between messages is the normal state — but "unbounded"
+ * must not mean "unstoppable": with a client connected, the message loop's
+ * own exit condition is never evaluated, because control never returns from
+ * this function. SIGTERM then did nothing at all until systemd gave up
+ * ninety seconds later and sent SIGKILL, which also meant the device was
+ * never closed cleanly. */
+extern volatile sig_atomic_t halo_io_aborted;
 
 /* Reads exactly len bytes or returns -1 on error/EOF.
  *
@@ -49,6 +59,7 @@ static inline int halo_read_full(int fd, void *buf, size_t len) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (halo_io_aborted) return -1;
             if (got == 0) continue; /* idle between messages: keep waiting */
             stalled_seconds += HALO_SOCKET_TIMEOUT_SECONDS;
             if (stalled_seconds >= HALO_STALL_LIMIT_SECONDS) {
@@ -85,6 +96,7 @@ static inline int halo_write_full(int fd, const void *buf, size_t len) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (halo_io_aborted) return -1;
             stalled_seconds += HALO_SOCKET_TIMEOUT_SECONDS;
             if (stalled_seconds >= HALO_STALL_LIMIT_SECONDS) {
                 fprintf(stderr, "halo: peer stopped reading for %ds, "

@@ -618,6 +618,20 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
 int halo_alsa_drain(halo_alsa_ctx_t *ctx) {
     if (!ctx->is_open) return 0;
 
+    /* Only a stream that is actually running has a tail to play out. After an
+     * underrun it sits in XRUN, and before the first write in PREPARED —
+     * draining either waits for a playback position that will never advance,
+     * which on real hardware means the full timeout below, every time.
+     *
+     * This is not hypothetical: a hard-cut FORMAT clears the ring, so the
+     * device has usually underrun by the time the switch reopens it, and the
+     * log filled with "drain did not finish in 3000ms" — three seconds of
+     * dead air at each format change, spent waiting for nothing. */
+    snd_pcm_state_t state = snd_pcm_state(ctx->pcm);
+    if (state != SND_PCM_STATE_RUNNING) {
+        return 0;
+    }
+
     /* Bounded, because a blocking snd_pcm_drain() can wait forever and the
      * caller holds the device lock across it. A stream that is not actually
      * running — stopped after an underrun, or prepared but never started —

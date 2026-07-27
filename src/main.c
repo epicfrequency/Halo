@@ -47,6 +47,15 @@
  * MiB of locked RAM — immaterial on a Pi 5, but worth knowing before
  * raising it much further. */
 #define RING_CAPACITY (1u << 24)
+
+/* Shutdown is checked in three places that can each block for a long time:
+ * the accept loop, the per-connection message loop, and the socket I/O
+ * helpers in net_io.h. Missing any one of them means SIGTERM is ignored for
+ * as long as that place is willing to wait. */
+static volatile sig_atomic_t g_shutdown = 0;
+/* Declared in net_io.h — read by the blocking I/O helpers so an idle socket
+ * wait unblocks on shutdown instead of outliving the request. */
+volatile sig_atomic_t halo_io_aborted = 0;
 #define DEFAULT_PORT 5555
 
 /* Legacy-sender fallback only: how long the active stream's AUDIO_DATA may
@@ -1114,7 +1123,7 @@ static void handle_flush(halo_state_t *st) {
 /* ---------------- Network reader loop (main thread per connection) ---------------- */
 
 static void connection_loop(halo_state_t *st) {
-    while (atomic_load(&st->running)) {
+    while (atomic_load(&st->running) && !g_shutdown) {
         struct halo_header hdr;
         if (halo_read_full(st->sockfd, &hdr, HALO_HEADER_SIZE) < 0) break;
         if (hdr.magic != HALO_MAGIC) {
@@ -1198,12 +1207,12 @@ done:
 
 /* ---------------- signal handling (clean systemd stop) ---------------- */
 
-static volatile sig_atomic_t g_shutdown = 0;
 static int g_listen_fd = -1;
 
 static void on_shutdown_signal(int signo) {
     (void)signo;
     g_shutdown = 1;
+    halo_io_aborted = 1;
     /* accept() is blocking with no SA_RESTART below, so it wakes up with
      * EINTR on its own; closing the listen fd here as well is a belt-and-
      * suspenders way to unstick it immediately even if some libc restarts
