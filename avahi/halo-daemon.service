@@ -1,0 +1,28 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Static Avahi/mDNS service definition — this is the entire discovery
+  mechanism. No code in halo-daemon itself does any mDNS work; Avahi (which
+  is already running on virtually any Raspberry Pi OS install) watches
+  /etc/avahi/services/ and advertises whatever .service files it finds,
+  picking up changes automatically with no daemon restart needed.
+
+  This is interoperable with Apple's Bonjour out of the box — they're the
+  same protocol (mDNS/DNS-SD, RFC 6762/6763), just different names for it.
+  A macOS NWBrowser looking for "_halo._tcp" will find this without any
+  extra software on the Pi5 side.
+
+  %h expands to the Pi's hostname, so multiple units on a LAN show up with
+  distinct, human-readable names instead of colliding.
+-->
+<service-group>
+  <name replace-wildcards="yes">HALO Audio Endpoint on %h</name>
+  <service>
+    <type>_halo._tcp</type>
+    <port>5555</port>
+    <!-- Bump this if PROTOCOL.md's version number ever changes, so a
+         sender can sanity-check compatibility before even opening the
+         TCP connection. -->
+    <txt-record>proto_version=1</txt-record>
+  </service>
+</service-group>

@@ -1,0 +1,69 @@
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -Wextra -std=c11 -pthread
+
+# Which ALSA format native DSD is sent as. This is a property of the DAC,
+# not a preference: `cat /proc/asound/cardN/stream0` shows the one your
+# device advertises (look for "Format: SPECIAL DSD_U32_BE" or similar).
+# Getting it wrong is not a graceful failure — the byte order is simply
+# reversed and you hear noise. Default matches the most common XMOS
+# firmware; override when your DAC says otherwise:
+#
+#     make DSD_FORMAT=DSD_U32_BE
+#
+DSD_FORMAT ?= DSD_U32_LE
+CFLAGS += -DHALO_DSD_ALSA_FORMAT=SND_PCM_FORMAT_$(DSD_FORMAT)
+LDFLAGS ?= -lasound -pthread
+
+SRC = src/main.c src/alsa_output.c
+OBJ = $(SRC:.c=.o)
+BIN = halo-daemon
+
+.PHONY: all clean check check-linux
+
+all: $(BIN)
+
+$(BIN): $(OBJ)
+	$(CC) $(OBJ) -o $(BIN) $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJ) $(BIN)
+
+# Offline self-test: build against the bundled ALSA stub and drive the
+# daemon through every protocol message, asserting replies and the runtime
+# files it publishes. No ALSA, no DAC and no root required — the point is to
+# catch regressions here in seconds rather than on the Pi.
+#
+# It cannot test what only real hardware can: hw_params negotiation, whether
+# the DAC accepts native DSD, DSD bit order, or how it sounds.
+STUB_DIR = tools/alsa-stub
+CHECK_RUNTIME = /tmp/halo-selftest
+CHECK_PORT = 5601
+
+check:
+	@echo "==> Building against the ALSA stub"
+	@rm -rf $(CHECK_RUNTIME) && mkdir -p $(CHECK_RUNTIME)
+	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread \
+		-I src -I $(STUB_DIR) \
+		-DHALO_RUNTIME_DIR='"$(CHECK_RUNTIME)"' \
+		src/main.c src/alsa_output.c $(STUB_DIR)/alsa_stub.c \
+		-o /tmp/halo-daemon-selftest
+	@echo "==> Running protocol self-test"
+	@/tmp/halo-daemon-selftest stub:0,0 $(CHECK_PORT) > /tmp/halo-selftest.log 2>&1 & \
+		echo $$! > /tmp/halo-selftest.pid
+	@sleep 1
+	@python3 tools/protocol_selftest.py $(CHECK_PORT) $(CHECK_RUNTIME); \
+		status=$$?; \
+		kill `cat /tmp/halo-selftest.pid` 2>/dev/null; \
+		rm -f /tmp/halo-selftest.pid; \
+		if [ $$status -ne 0 ]; then echo; echo "daemon log:"; cat /tmp/halo-selftest.log; fi; \
+		exit $$status
+
+# Stricter sibling of `check`: same self-test, but compiled against the real
+# libasound headers on the Pi's architecture inside a container, where
+# snd_pcm_open genuinely fails and so exercises the FORMAT_REJECTED path the
+# stub cannot reach. Needs docker (colima works).
+check-linux:
+	@tools/check-linux.sh

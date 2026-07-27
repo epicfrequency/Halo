@@ -1,0 +1,46 @@
+[Unit]
+Description=HALO audio endpoint daemon (hi-res PCM/DSD receiver)
+# sound.target exists on most distros incl. Raspberry Pi OS; harmless if
+# it doesn't, systemd just treats it as an ordering-only dependency.
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/halo-daemon hw:1,0 5555
+Restart=on-failure
+RestartSec=1
+
+# --- run as an unprivileged, dedicated user, not root ---
+User=halo
+Group=halo
+# needed for /dev/snd/* access without being in the audio group's default
+# ACL setup on every distro; simplest is adding the `halo` user to `audio`.
+SupplementaryGroups=audio
+
+# --- let the process (specifically, its pthread_setschedparam(SCHED_FIFO)
+#     calls) actually take effect without running as root ---
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+# NoNewPrivileges is fine together with AmbientCapabilities (this is the
+# standard secure combo, not a contradiction).
+NoNewPrivileges=yes
+
+# Creates /run/halo-daemon owned by this service (and removes it on stop).
+# The daemon publishes now-playing state, metadata and cover art there for a
+# local display to read — see PROTOCOL.md "Runtime files".
+RuntimeDirectory=halo-daemon
+RuntimeDirectoryMode=0755
+
+# --- light hardening; nothing here touches the ALSA/network paths ---
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# needs write access to /dev/snd/* despite ProtectSystem=strict:
+DeviceAllow=/dev/snd rw
+PrivateDevices=no
+
+[Install]
+WantedBy=multi-user.target
