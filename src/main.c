@@ -75,6 +75,12 @@ typedef struct {
     uint32_t format_id[2];
     int active_idx;              /* which of ring[0]/ring[1] feeds ALSA right now */
     int pending_valid;           /* is the *other* ring holding a preannounced track? */
+    int pending_is_preannounce;  /* 1 if the sender preannounced it, 0 if a hard-cut FORMAT
+                                  * staged it. Both use pending_valid/switch_requested to
+                                  * reach the writer's flip, so without this the log called
+                                  * every manual skip a "gapless switch" — which made a
+                                  * daemon that had received exactly one preannounce look
+                                  * like it was doing gapless twenty-five times. */
     int switch_requested;        /* sender sent SWITCH_TO_PENDING for the pending slot:
                                   * flip to it as soon as the active ring drains
                                   * (guarded by state_mtx, like pending_valid) */
@@ -407,7 +413,9 @@ static void *alsa_writer_thread(void *arg) {
                      * together for its pacing math to stay coherent. */
                     atomic_store(&st->frames_written, 0);
                     atomic_store(&st->last_active_data_ns, mono_ns());
-                    fprintf(stderr, "halo: gapless switch -> format_id=%u (%s reopen)\n",
+                    fprintf(stderr, "halo: %s -> format_id=%u (%s reopen)\n",
+                            st->pending_is_preannounce ? "gapless switch"
+                                                       : "hard-cut switch",
                             next_fid, same ? "no" : "with");
                 }
                 pthread_mutex_unlock(&st->state_mtx);
@@ -466,7 +474,13 @@ static void *alsa_writer_thread(void *arg) {
          * end of a track. Two seconds is far longer than any gap observed,
          * so it never fires on a slow sender, only on a finished one. */
         if (!halo_alsa_running_locked(st)) {
-            size_t prime_bytes = (size_t)(((uint64_t)fmt.sample_rate * frame_size) / 10u);
+            /* 300ms. Measured: 100ms was not enough — the sender delivers an
+             * initial prime of roughly 174ms and then pauses again before
+             * its fill loop takes over, so a gate below that opened, let the
+             * device start, and watched it starve in the second gap. The
+             * observed post-cut supply gaps ran 250-600ms; the cushion has
+             * to outlast them or it is only moving the underrun later. */
+            size_t prime_bytes = (size_t)(((uint64_t)fmt.sample_rate * frame_size * 3u) / 10u);
             uint64_t quiet_ns = mono_ns() - atomic_load(&st->last_active_data_ns);
             if (usable_bytes < prime_bytes && quiet_ns < 2000000000ull) {
                 usleep(2000);
@@ -675,16 +689,34 @@ static void report_status(halo_state_t *st, int force) {
                  (unsigned long long)atomic_load(&st->underrun_count),
                  atomic_load(&st->paused) ? " | PAUSED" : "");
 
-        /* Everything above except the elapsed time and the ring percentage.
-         * Those two move several times a second, so comparing the whole line
-         * turned the print-on-change filter below into a print-always filter:
-         * 23,000 of the 27,000 lines in a twelve-hour journal were this one
-         * status line, three a second, all night. They still get printed —
-         * just on the heartbeat's cadence rather than driving it. */
-        snprintf(key, sizeof(key), "%s|%u|%d|%llu|%s|%d",
+        /* Everything above except the elapsed time, and the ring percentage
+         * only while it is low.
+         *
+         * Comparing the whole line turned the print-on-change filter below
+         * into a print-always filter: 23,000 of the 27,000 lines in a
+         * twelve-hour journal were this one status line, three a second, all
+         * night, because the elapsed seconds and a ring jittering between 40
+         * and 45 percent never stop changing.
+         *
+         * But dropping the ring entirely went too far the other way. A ring
+         * draining toward empty is the one thing worth watching — it is what
+         * a gapless boundary looks like from here, and what precedes every
+         * underrun — and at a 30-second heartbeat that whole story happens
+         * between two lines. So: healthy occupancy collapses to a single
+         * value and stays quiet, while a ring on its way to empty prints
+         * each 5% step it loses.
+         *
+         * The threshold has to sit below steady state or it is no filter at
+         * all. Measured on this hardware, a healthy DSD64 stream sits at
+         * 20-25% and flips between the two buckets about twice a second, so
+         * a quarter-full threshold put the flood straight back. Below 15%
+         * the ring is genuinely running down: a gapless boundary shows as
+         * 10, 5, 0 and an approaching underrun shows the same. */
+        unsigned ring_band = ring_pct < 15u ? ring_pct : 100u;
+        snprintf(key, sizeof(key), "%s|%u|%d|%llu|%s|%d|%u",
                  fmt_desc, fid, pending,
                  (unsigned long long)atomic_load(&st->underrun_count),
-                 spill_note, atomic_load(&st->paused) ? 1 : 0);
+                 spill_note, atomic_load(&st->paused) ? 1 : 0, ring_band);
     }
 
     uint64_t now = mono_ns();
@@ -984,6 +1016,7 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
         st->fmt[other] = *fmt;
         st->format_id[other] = fmt->format_id;
         st->pending_valid = 1;
+        st->pending_is_preannounce = 1;
         /* Each preannounce waits for its own commit — never inherits one
          * left behind by a slot that was cancelled or overwritten. */
         st->switch_requested = 0;
@@ -1014,6 +1047,7 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
     st->fmt[other] = *fmt;
     st->format_id[other] = fmt->format_id;
     st->pending_valid = 1;
+    st->pending_is_preannounce = 0;
     st->switch_requested = 1;
     atomic_store(&st->paused, 0);
     atomic_store(&st->last_active_data_ns, mono_ns());

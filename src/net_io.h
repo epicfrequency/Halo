@@ -71,6 +71,12 @@ static inline int halo_read_full(int fd, void *buf, size_t len) {
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
+        /* Not a stall — the peer is gone, or the socket is. Named where
+         * errno is still this recv's own, because the callers only see -1. */
+        if (n < 0) {
+            fprintf(stderr, "halo: receive failed after %zu of %zu bytes: %s\n",
+                    got, len, strerror(errno));
+        }
         return -1;
     }
     return 0;
@@ -106,6 +112,14 @@ static inline int halo_write_full(int fd, const void *buf, size_t len) {
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
+        /* Named here, where errno is still the send's own. The two ways this
+         * function fails need telling apart: a peer that stopped reading
+         * (reported above, after the stall limit) is a peer that is still
+         * there and wedged, while a broken pipe or a reset is a peer that is
+         * simply gone. The callers only see -1, so without this a client
+         * that quit and a client that hung produced the same line. */
+        fprintf(stderr, "halo: send failed after %zu of %zu bytes: %s\n",
+                sent, len, strerror(errno));
         return -1;
     }
     return 0;
