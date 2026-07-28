@@ -632,39 +632,35 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
 int halo_alsa_drain(halo_alsa_ctx_t *ctx) {
     if (!ctx->is_open) return 0;
 
-    /* Only a stream that is actually running has a tail to play out. After an
-     * underrun it sits in XRUN, and before the first write in PREPARED —
-     * draining either waits for a playback position that will never advance,
-     * which on real hardware means the full timeout below, every time.
-     *
-     * This is not hypothetical: a hard-cut FORMAT clears the ring, so the
-     * device has usually underrun by the time the switch reopens it, and the
-     * log filled with "drain did not finish in 3000ms" — three seconds of
-     * dead air at each format change, spent waiting for nothing. */
-    snd_pcm_state_t state = snd_pcm_state(ctx->pcm);
-    if (state != SND_PCM_STATE_RUNNING) {
-        return 0;
-    }
+    /* Only a running stream has a tail to play out. After an underrun it sits
+     * in XRUN, and before the first write in PREPARED — draining either waits
+     * on a playback position that will never advance. */
+    if (snd_pcm_state(ctx->pcm) != SND_PCM_STATE_RUNNING) return 0;
 
-    /* Bounded, because a blocking snd_pcm_drain() can wait forever and the
-     * caller holds the device lock across it. A stream that is not actually
-     * running — stopped after an underrun, or prepared but never started —
-     * has nothing draining it, so the wait never ends; the FLUSH that would
-     * clear the situation is stuck behind the same lock, on the very thread
-     * that reads the socket, so nothing can arrive to break it either. Same
-     * permanent wedge as blocking the reader directly, reached by a
-     * different route.
+    /* Bounded and non-blocking, because a blocking snd_pcm_drain() can wait
+     * forever while the caller holds the device lock — and the thread that
+     * would clear that situation is the one blocked on the same lock.
      *
-     * Non-blocking mode turns the wait into a poll this function controls.
-     * Draining is a courtesy at a format-changing handover (let the old
-     * tail finish), never a correctness requirement, so giving up and
-     * dropping is a sound worst case: at most the last fraction of a second
-     * of the outgoing track is cut. */
+     * The state is re-checked every iteration, not just on entry, and that is
+     * the part that matters here. This is called at a gapless handover, which
+     * happens precisely when the active ring has drained to empty — so the
+     * device is on the verge of underrunning. It enters RUNNING, plays out
+     * its remaining buffer, and then goes to XRUN, after which snd_pcm_drain()
+     * returns -EAGAIN forever. Checking only on entry meant every
+     * format-changing transition burned the full timeout: three seconds of
+     * silence, waiting for a tail that had already finished. */
     const int deadline_ms = 3000;
     int waited_ms = 0;
     snd_pcm_nonblock(ctx->pcm, 1);
     int err;
     while ((err = snd_pcm_drain(ctx->pcm)) == -EAGAIN) {
+        snd_pcm_state_t state = snd_pcm_state(ctx->pcm);
+        if (state != SND_PCM_STATE_RUNNING && state != SND_PCM_STATE_DRAINING) {
+            /* Everything that could play has played. Not a failure — the tail
+             * is out, the device simply ran dry rather than reaching the end
+             * of a drain it never got more data for. */
+            break;
+        }
         if (waited_ms >= deadline_ms) {
             fprintf(stderr, "halo: drain did not finish in %dms, dropping the tail\n",
                     deadline_ms);
@@ -676,7 +672,7 @@ int halo_alsa_drain(halo_alsa_ctx_t *ctx) {
         waited_ms += 5;
     }
     snd_pcm_nonblock(ctx->pcm, 0);
-    return err;
+    return err == -EAGAIN ? 0 : err;
 }
 
 int halo_alsa_drop_and_prepare(halo_alsa_ctx_t *ctx) {

@@ -273,6 +273,48 @@ itself is validated as well-formed XML matching Avahi's documented schema,
 but do run `avahi-browse -r _halo._tcp` from a second machine once this is
 on real hardware to confirm it actually announces.
 
+## What the journal shows
+
+Quiet when healthy. Once per track:
+
+```
+halo: cover art updated (41239 bytes, 0aac8ea8b79fb72a...)
+halo: now playing: Love Forever — Paula Tsui · Paula Tsui Best Collection
+[halo] DSD64 native 1-bit 2.822 MHz @ 88.2 kHz 2ch | fmt#3 | ring 10% | 0:00:03 | xrun 1
+```
+
+The status line prints on change plus a heartbeat, not on a fixed tick — under
+journald a line every second is pure noise. Two rates appear for DSD and DoP
+because they differ: the MHz figure is the music, the kHz figure is what the
+card is clocked at, and only the second can be checked against
+`aplay --dump-hw-params` or the DAC's own display.
+
+METADATA may also carry `coverart_ansi`, a terminal rendering of the cover
+the sender produced while making its thumbnail. The daemon prints it once per
+change and stores it with the rest of the JSON; it is optional, and a display
+with a real screen should ignore it and read `coverart.bin` instead.
+
+Note that `journalctl`'s default output filters control characters, which
+takes the colour with it and leaves a black rectangle. Use `-o cat` to see it:
+
+```
+journalctl -u halo-daemon -f -o cat
+```
+
+The daemon never decodes an image. It stores what the sender transmits and
+that is all — a JPEG decoder fed from the network has no business sharing a
+process with a SCHED_FIFO audio thread. A display program belongs in its own
+unit, reading the files below; then it can crash, restart, or be rewritten
+without playback noticing.
+
+| file (in `/run/halo-daemon`, tmpfs — no SD-card writes) | written from |
+|---|---|
+| `status.json` | live: format, both rates, position, ring, underruns |
+| `caps.json` | what the device reported at connect |
+| `metadata.json` | sender's METADATA, verbatim (track, album, track list, source) |
+| `coverart.bin` | sender's COVERART, image bytes as sent (JPEG in practice) |
+| `coverart.sha256` | digest of the above, matching `metadata.json`'s `coverart_sha256` |
+
 ## Things you will likely need to tune per-DAC
 
 - **Buffer/period sizing** in `open_locked()` (`src/alsa_output.c`):

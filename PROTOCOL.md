@@ -657,7 +657,7 @@ playback.
 
 ## Metadata size limits
 
-`METADATA` is capped at 64 KiB and `COVERART` at 4 MiB. Anything larger must
+`METADATA` is capped at 256 KiB and `COVERART` at 4 MiB. Anything larger must
 be drained and discarded rather than buffered.
 
 The cap exists because control and audio share one TCP stream and one serial

@@ -1034,6 +1034,7 @@ typedef struct {
 
 static halo_media_t g_media = { .mtx = PTHREAD_MUTEX_INITIALIZER };
 
+
 static void media_sha_hex(const uint8_t sha[32], char out[65]) {
     for (int i = 0; i < 32; i++) snprintf(out + i * 2, 3, "%02x", sha[i]);
 }
@@ -1052,6 +1053,148 @@ static int drain_payload(halo_state_t *st, uint32_t remaining, int fd) {
         remaining -= want;
     }
     return 0;
+}
+
+/* Pulls one string value out of the METADATA JSON without linking a parser.
+ *
+ * Deliberately crude: the daemon's contract is to store the payload verbatim
+ * and let a display parse it properly (PROTOCOL.md). This exists only so the
+ * journal can say which song is playing, which is the difference between a
+ * log that reads "DSD64 2ch" and one that reads like a now-playing screen —
+ * and until there is a screen on the Pi, the journal *is* the screen.
+ *
+ * Finds `"key"` inside `object` (or anywhere, if object is NULL) and copies
+ * the following string literal, undoing only the escapes JSON requires. */
+static int json_string_field(const char *json, size_t json_len,
+                             const char *object, const char *key,
+                             char *out, size_t out_len) {
+    if (out_len == 0) return -1;
+    out[0] = '\0';
+
+    /* Copied whole so the needle searches can rely on NUL termination.
+     *
+     * Sized to the message rather than to a fixed buffer: the sender
+     * serialises its JSON with sorted keys, which puts `track` last — after a
+     * cover rendering that can run past a hundred kilobytes. A fixed 64 KiB
+     * scratch silently truncated the document short of the very field this
+     * function exists to read, so the log lost the song title exactly when the
+     * art got big enough to be worth looking at. */
+    char *buf = malloc(json_len + 1);
+    if (!buf) return -1;
+    memcpy(buf, json, json_len);
+    buf[json_len] = '\0';
+
+    const char *scan = buf;
+    if (object) {
+        char object_key[64];
+        snprintf(object_key, sizeof(object_key), "\"%s\"", object);
+        scan = strstr(buf, object_key);
+        if (!scan) { free(buf); return -1; }
+    }
+
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *found = strstr(scan, needle);
+    if (!found) { free(buf); return -1; }
+    const char *colon = strchr(found + strlen(needle), ':');
+    if (!colon) { free(buf); return -1; }
+    const char *quote = strchr(colon, '"');
+    if (!quote) { free(buf); return -1; }
+
+    size_t written = 0;
+    for (const char *p = quote + 1; *p && written + 1 < out_len; p++) {
+        if (*p == '"') break;
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+                case 'n': out[written++] = ' '; break;   /* keep the line one line */
+                case 't': out[written++] = ' '; break;
+                case 'u': /* leave escapes alone rather than half-decode UTF-16 */
+                    if (written + 6 < out_len) {
+                        memcpy(out + written, p - 1, 6);
+                        written += 6;
+                    }
+                    p += 4;
+                    break;
+                default: out[written++] = *p; break;
+            }
+            continue;
+        }
+        out[written++] = *p;
+    }
+    out[written] = '\0';
+    free(buf);
+    return written > 0 ? 0 : -1;
+}
+
+static void print_coverart_ansi(const char *json, size_t json_len) {
+    /* Sized from the protocol cap rather than a guess: the rendering can be
+     * most of a METADATA message, and a buffer smaller than that would
+     * silently truncate the comparison and re-print art that had not
+     * changed. */
+    static char last_render[HALO_METADATA_MAX_BYTES];
+
+    const char *key = "\"coverart_ansi\"";
+    char *buf = malloc(json_len + 1);
+    if (!buf) return;
+    memcpy(buf, json, json_len);
+    buf[json_len] = '\0';
+
+    const char *found = strstr(buf, key);
+    if (!found) { free(buf); return; }
+    const char *colon = strchr(found + strlen(key), ':');
+    if (!colon) { free(buf); return; }
+    const char *quote = strchr(colon, '"');
+    if (!quote) { free(buf); return; }
+
+    char *render = malloc(json_len + 1);
+    if (!render) { free(buf); return; }
+    size_t written = 0;
+    for (const char *c = quote + 1; *c; c++) {
+        if (*c == '"') break;
+        if (*c != '\\') { render[written++] = *c; continue; }
+        c++;
+        if (!*c) break;
+        switch (*c) {
+            case 'n': render[written++] = '\n'; break;
+            case 't': render[written++] = '\t'; break;
+            case 'r': break;
+            case 'u': {
+                unsigned code = 0;
+                if (sscanf(c + 1, "%4x", &code) != 1) { c += 4; break; }
+                c += 4;
+                /* Minimal UTF-8 encoder. Only two things arrive this way: the
+                 * ESC that starts every colour sequence, and U+2580, the half
+                 * block the rendering is drawn with. */
+                if (code < 0x80) {
+                    render[written++] = (char)code;
+                } else if (code < 0x800) {
+                    render[written++] = (char)(0xC0 | (code >> 6));
+                    render[written++] = (char)(0x80 | (code & 0x3F));
+                } else {
+                    render[written++] = (char)(0xE0 | (code >> 12));
+                    render[written++] = (char)(0x80 | ((code >> 6) & 0x3F));
+                    render[written++] = (char)(0x80 | (code & 0x3F));
+                }
+                break;
+            }
+            default: render[written++] = *c; break;
+        }
+    }
+    render[written] = '\0';
+    free(buf);
+
+    if (written == 0 || strcmp(render, last_render) == 0) { free(render); return; }
+    snprintf(last_render, sizeof(last_render), "%s", render);
+
+    char *line = render;
+    while (line && *line) {
+        char *newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        fprintf(stderr, "%s\n", line);
+        line = newline ? newline + 1 : NULL;
+    }
+    free(render);
 }
 
 static void handle_metadata(halo_state_t *st, uint32_t len, int fd) {
@@ -1073,7 +1216,32 @@ static void handle_metadata(halo_state_t *st, uint32_t len, int fd) {
     /* Stored verbatim — the daemon has no opinion on the contents beyond
      * PROTOCOL.md's schema being the sender's contract with the display. */
     write_file_atomic("metadata.json", g_media.metadata, len);
+
+    char title[192] = "", artist[128] = "", album[160] = "";
+    json_string_field(g_media.metadata, len, "track", "title", title, sizeof(title));
+    json_string_field(g_media.metadata, len, "track", "artist", artist, sizeof(artist));
+    json_string_field(g_media.metadata, len, "track", "album", album, sizeof(album));
     pthread_mutex_unlock(&g_media.mtx);
+
+    /* Announced on change, not on arrival. A sender may legitimately re-send
+     * the same metadata — after a reconnect, or simply because its own
+     * change-detection hiccuped — and repeating a line that says nothing new
+     * is exactly the noise the print-on-change status line exists to avoid.
+     * Deduping here means the log stays right regardless of how the other
+     * side behaves. */
+    static char last_announced[512];
+    if (title[0]) {
+        char announcement[512];
+        snprintf(announcement, sizeof(announcement), "%s%s%s%s%s",
+                 title,
+                 artist[0] ? " — " : "", artist[0] ? artist : "",
+                 album[0] ? " · " : "", album[0] ? album : "");
+        if (strcmp(announcement, last_announced) != 0) {
+            snprintf(last_announced, sizeof(last_announced), "%s", announcement);
+            fprintf(stderr, "halo: now playing: %s\n", announcement);
+        }
+    }
+    print_coverart_ansi(g_media.metadata, len);
 }
 
 static void handle_coverart(halo_state_t *st, uint32_t len, int fd) {

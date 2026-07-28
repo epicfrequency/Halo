@@ -59,6 +59,7 @@ const char *snd_pcm_format_name(snd_pcm_format_t format);
 int snd_pcm_nonblock(snd_pcm_t *p, int nonblock);
 typedef int snd_pcm_state_t;
 #define SND_PCM_STATE_RUNNING 3
+#define SND_PCM_STATE_DRAINING 5
 snd_pcm_state_t snd_pcm_state(snd_pcm_t *p);
 const char *snd_strerror(int errnum);
 
