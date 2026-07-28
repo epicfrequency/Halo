@@ -82,8 +82,36 @@ check-race:
 		if [ $$rc -ne 0 ]; then exit $$rc; fi; \
 		echo "  PASS  no ALSA bad-state hits under FLUSH/FORMAT storm"
 
+check-quiet:
+	@echo "==> Journal noise check"
+	@rm -rf /tmp/halo-quiet-rt && mkdir -p /tmp/halo-quiet-rt
+	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
+		-DHALO_RUNTIME_DIR='"/tmp/halo-quiet-rt"' \
+		src/main.c src/alsa_output.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-quiet-daemon
+	@/tmp/halo-quiet-daemon stub:0,0 5661 > /tmp/halo-quiet.log 2>&1 & \
+		echo $$! > /tmp/halo-quiet.pid
+	@sleep 1.5
+	@python3 tools/journal_noise_test.py 5661 /tmp/halo-quiet.log 8; rc=$$?; \
+		kill `cat /tmp/halo-quiet.pid` 2>/dev/null; \
+		exit $$rc
+
+check-prime:
+	@echo "==> Prime-gate check"
+	@rm -rf /tmp/halo-prime-rt && mkdir -p /tmp/halo-prime-rt
+	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \
+		-DHALO_RUNTIME_DIR='"/tmp/halo-prime-rt"' \
+		src/main.c src/alsa_output.c $(STUB_DIR)/alsa_stub.c -o /tmp/halo-prime-daemon
+	@/tmp/halo-prime-daemon stub:0,0 5671 > /tmp/halo-prime.log 2>&1 & \
+		echo $$! > /tmp/halo-prime.pid
+	@sleep 1.5
+	@python3 tools/prime_gate_test.py 5671 /tmp/halo-prime-rt; rc=$$?; \
+		kill `cat /tmp/halo-prime.pid` 2>/dev/null; \
+		exit $$rc
+
 check:
 	@$(MAKE) --no-print-directory check-race
+	@$(MAKE) --no-print-directory check-prime
+	@$(MAKE) --no-print-directory check-quiet
 	@$(MAKE) --no-print-directory check-pause
 	@echo "==> Running sample-packing tests"
 	@$(CC) -std=c11 -Wall -Wextra -Werror -pthread -I src -I $(STUB_DIR) \

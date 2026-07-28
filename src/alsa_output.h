@@ -73,6 +73,11 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
 
 /* Let currently-buffered audio finish playing out (used at end of a
  * format-changing gapless transition, NOT used for seek). */
+/* Whether the device is actually playing, as opposed to prepared and
+ * waiting. An unstarted stream cannot underrun, which is what makes it worth
+ * asking before handing over the first bytes after a flush. */
+int halo_alsa_is_running(halo_alsa_ctx_t *ctx);
+
 int halo_alsa_drain(halo_alsa_ctx_t *ctx);
 
 /* Immediately discard buffered audio and get ready for new data (used for

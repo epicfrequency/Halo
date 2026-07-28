@@ -386,12 +386,17 @@ static int open_with_format(halo_alsa_ctx_t *ctx, const char *device_name,
                 rate, actual_rate);
     }
 
-    /* Generous buffer (~500ms) to absorb network jitter; moderate period
-     * count so wakeups aren't too frequent nor too coarse. */
+    /* Generous buffer (~500ms) to absorb network jitter. */
     unsigned int buffer_time_us = 500000;
     snd_pcm_hw_params_set_buffer_time_near(ctx->pcm, params, &buffer_time_us, NULL);
-    unsigned int periods = 8;
-    snd_pcm_hw_params_set_periods_near(ctx->pcm, params, &periods, NULL);
+    /* ~10ms periods rather than a fixed period *count*, so the writer's
+     * wakeup interval stays the same at every rate instead of scaling with
+     * the buffer. The size matters because the start threshold below is only
+     * safe in units of periods: at a fixed 50ms of cushion, 10ms periods
+     * give the writer five late wakeups of slack where 25ms ones would give
+     * two. A hundred wakeups a second is nothing on this hardware. */
+    unsigned int period_time_us = 10000;
+    snd_pcm_hw_params_set_period_time_near(ctx->pcm, params, &period_time_us, NULL);
 
     err = snd_pcm_hw_params(ctx->pcm, params);
     if (err < 0) {
@@ -402,6 +407,52 @@ static int open_with_format(halo_alsa_ctx_t *ctx, const char *device_name,
 
     snd_pcm_hw_params_get_period_size(params, &ctx->period_size, NULL);
     snd_pcm_hw_params_get_buffer_size(params, &ctx->buffer_size_frames);
+
+    /* Start once ~30ms is queued — not on the first frame, and not on a
+     * full buffer either.
+     *
+     * ALSA's default start_threshold is one frame, so the device begins
+     * playing the instant the first write lands and runs with whatever
+     * cushion happened to be queued — which, straight after a prepare, is
+     * nothing. Every seek and every track cut therefore started playback on
+     * an almost-empty buffer and starved before the next few hundred
+     * milliseconds arrived over the network: an -EPIPE, a recovery, and a
+     * dropout reported to the sender, on every single one of them.
+     *
+     * The obvious correction — wait for the whole buffer — trades that for a
+     * different fault. The buffer and the start threshold protect against
+     * different things: the buffer covers how late the writer thread may be
+     * scheduled, while the threshold only decides how much cushion playback
+     * begins with. Tying the threshold to the buffer meant no sound at all
+     * until 500ms had arrived, which at 768kHz PCM is three megabytes; the
+     * position sat still for that whole time and dragging the seek bar felt
+     * like it was fighting back.
+     *
+     * 30ms is three of the periods configured above, so the writer can be
+     * late three times over before the cushion is gone, and by then the
+     * sender — which reads ahead of real time — has long since refilled it.
+     * Deep buffer, shallow start.
+     *
+     * Measured, not guessed: 20ms produced five underruns across one burst
+     * of seeks on real hardware, and 50ms produced none. Three periods is
+     * the floor that still held. */
+    snd_pcm_uframes_t start_threshold =
+        (snd_pcm_uframes_t)(((uint64_t)rate * 30u) / 1000u);
+    if (start_threshold < ctx->period_size) start_threshold = ctx->period_size;
+    if (start_threshold > ctx->buffer_size_frames) start_threshold = ctx->buffer_size_frames;
+
+    snd_pcm_sw_params_t *sw_params;
+    snd_pcm_sw_params_alloca(&sw_params);
+    if (snd_pcm_sw_params_current(ctx->pcm, sw_params) == 0) {
+        snd_pcm_sw_params_set_start_threshold(ctx->pcm, sw_params, start_threshold);
+        snd_pcm_sw_params_set_avail_min(ctx->pcm, sw_params, ctx->period_size);
+        err = snd_pcm_sw_params(ctx->pcm, sw_params);
+        if (err < 0 && !quiet) {
+            /* Not fatal: the old behaviour is what we get, which played
+             * correctly and merely reported dropouts it caused itself. */
+            fprintf(stderr, "halo: sw_params commit failed: %s\n", snd_strerror(err));
+        }
+    }
 
     err = snd_pcm_prepare(ctx->pcm);
     if (err < 0) {
@@ -414,9 +465,14 @@ static int open_with_format(halo_alsa_ctx_t *ctx, const char *device_name,
     ctx->is_open = 1;
     strncpy(ctx->device_name, device_name, sizeof(ctx->device_name) - 1);
 
-    fprintf(stderr, "halo: opened %s: %s, %u ch, %u Hz (requested), period=%lu buffer=%lu frames\n",
+    fprintf(stderr, "halo: opened %s: %s, %u ch, %u Hz (requested), "
+                    "period=%lu buffer=%lu start=%lu frames (%.0f/%.0f/%.0f ms)\n",
             device_name, snd_pcm_format_name(alsa_fmt), fmt->channels, rate,
-            (unsigned long)ctx->period_size, (unsigned long)ctx->buffer_size_frames);
+            (unsigned long)ctx->period_size, (unsigned long)ctx->buffer_size_frames,
+            (unsigned long)start_threshold,
+            ctx->period_size * 1000.0 / rate,
+            ctx->buffer_size_frames * 1000.0 / rate,
+            start_threshold * 1000.0 / rate);
 
     return 0;
 }
@@ -684,13 +740,26 @@ snd_pcm_sframes_t halo_alsa_write(halo_alsa_ctx_t *ctx, const void *frames,
     return (snd_pcm_sframes_t)(total_frames * ticks_per_frame);
 }
 
+int halo_alsa_is_running(halo_alsa_ctx_t *ctx) {
+    if (!ctx->is_open) return 0;
+    return snd_pcm_state(ctx->pcm) == SND_PCM_STATE_RUNNING;
+}
+
 int halo_alsa_drain(halo_alsa_ctx_t *ctx) {
     if (!ctx->is_open) return 0;
 
-    /* Only a running stream has a tail to play out. After an underrun it sits
-     * in XRUN, and before the first write in PREPARED — draining either waits
-     * on a playback position that will never advance. */
-    if (snd_pcm_state(ctx->pcm) != SND_PCM_STATE_RUNNING) return 0;
+    /* A stream still in PREPARED holds audio that was written but never
+     * started, because it did not reach the start threshold set above. That
+     * is the short-tail case at a gapless handover, and it has a real tail
+     * to play — it just needs starting. Nothing else does: after an underrun
+     * the stream sits in XRUN, and draining that waits on a playback
+     * position that will never advance. */
+    snd_pcm_state_t entry_state = snd_pcm_state(ctx->pcm);
+    if (entry_state == SND_PCM_STATE_PREPARED) {
+        if (snd_pcm_start(ctx->pcm) < 0) return 0;
+    } else if (entry_state != SND_PCM_STATE_RUNNING) {
+        return 0;
+    }
 
     /* Bounded and non-blocking, because a blocking snd_pcm_drain() can wait
      * forever while the caller holds the device lock — and the thread that
@@ -717,8 +786,14 @@ int halo_alsa_drain(halo_alsa_ctx_t *ctx) {
             break;
         }
         if (waited_ms >= deadline_ms) {
-            fprintf(stderr, "halo: drain did not finish in %dms, dropping the tail\n",
-                    deadline_ms);
+            /* Name the state and the outstanding frames. "Dropping the tail"
+             * on its own says a tail was lost but not why it never played,
+             * and those are different bugs with different fixes. */
+            snd_pcm_sframes_t delay = 0;
+            (void)snd_pcm_delay(ctx->pcm, &delay);
+            fprintf(stderr, "halo: drain did not finish in %dms (state=%s, "
+                            "delay=%ld frames), dropping the tail\n",
+                    deadline_ms, snd_pcm_state_name(state), (long)delay);
             snd_pcm_nonblock(ctx->pcm, 0);
             snd_pcm_drop(ctx->pcm);
             return snd_pcm_prepare(ctx->pcm);

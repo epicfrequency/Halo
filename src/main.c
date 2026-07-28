@@ -258,6 +258,16 @@ static void spill_drain_into_ring(halo_state_t *st, int idx) {
     pthread_mutex_unlock(&st->spill_mtx);
 }
 
+/* The lock is the writer's own, but the state read is a plain ALSA call, so
+ * it goes through alsa_mtx like every other one — the network thread can be
+ * inside snd_pcm_drop at the same moment. */
+static int halo_alsa_running_locked(halo_state_t *st) {
+    pthread_mutex_lock(&st->alsa_mtx);
+    int running = halo_alsa_is_running(&st->alsa);
+    pthread_mutex_unlock(&st->alsa_mtx);
+    return running;
+}
+
 static void *alsa_writer_thread(void *arg) {
     halo_state_t *st = (halo_state_t *)arg;
     halo_set_realtime_priority();
@@ -433,6 +443,37 @@ static void *alsa_writer_thread(void *arg) {
             continue;
         }
 
+        /* Don't hand ALSA the first bytes of a stream until enough has
+         * arrived to keep it fed.
+         *
+         * An unstarted device cannot underrun; a started and empty one
+         * underruns immediately. After a seek or a track cut the device sits
+         * prepared while the sender re-seeks its decoder, and on real
+         * material that gap measured 250-600ms — a DSD decoder repositioning
+         * takes that long. Letting playback begin the moment a few
+         * milliseconds land meant it played those milliseconds, starved, and
+         * logged an -EPIPE plus a dropout report, on essentially every seek.
+         *
+         * No start threshold can cover a 600ms supply gap without also
+         * making every seek wait 600ms. Waiting on the *ring* instead costs
+         * nothing extra: the silence lasts exactly as long as the sender
+         * takes either way, and when the audio does arrive it arrives in a
+         * burst, so the cushion fills in a few milliseconds. The device then
+         * starts already fed.
+         *
+         * The quiet escape hatch is for a stream that legitimately holds
+         * less than this and no more is coming — seeking to just before the
+         * end of a track. Two seconds is far longer than any gap observed,
+         * so it never fires on a slow sender, only on a finished one. */
+        if (!halo_alsa_running_locked(st)) {
+            size_t prime_bytes = (size_t)(((uint64_t)fmt.sample_rate * frame_size) / 10u);
+            uint64_t quiet_ns = mono_ns() - atomic_load(&st->last_active_data_ns);
+            if (usable_bytes < prime_bytes && quiet_ns < 2000000000ull) {
+                usleep(2000);
+                continue;
+            }
+        }
+
         pthread_mutex_lock(&st->alsa_mtx);
         snd_pcm_uframes_t period = st->alsa.period_size;
         pthread_mutex_unlock(&st->alsa_mtx);
@@ -580,7 +621,7 @@ static void describe_format_with_rate(const struct halo_format *fmt,
  * every second would be pure noise. Quiet when healthy, immediate when
  * something moves. */
 static void report_status(halo_state_t *st, int force) {
-    static char last[256];
+    static char last_key[256];
     static uint64_t last_ns;
 
     pthread_mutex_lock(&st->state_mtx);
@@ -592,8 +633,10 @@ static void report_status(halo_state_t *st, int force) {
     pthread_mutex_unlock(&st->state_mtx);
 
     char line[256];
+    char key[256];
     if (!open_) {
         snprintf(line, sizeof(line), "[halo] idle — no stream open");
+        snprintf(key, sizeof(key), "idle");
     } else {
         char fmt_desc[96];
         /* The device's own clock, not the wire rate below — those differ for
@@ -631,21 +674,35 @@ static void report_status(halo_state_t *st, int force) {
                  ring_pct, spill_note, secs / 3600, (secs / 60) % 60, secs % 60,
                  (unsigned long long)atomic_load(&st->underrun_count),
                  atomic_load(&st->paused) ? " | PAUSED" : "");
+
+        /* Everything above except the elapsed time and the ring percentage.
+         * Those two move several times a second, so comparing the whole line
+         * turned the print-on-change filter below into a print-always filter:
+         * 23,000 of the 27,000 lines in a twelve-hour journal were this one
+         * status line, three a second, all night. They still get printed —
+         * just on the heartbeat's cadence rather than driving it. */
+        snprintf(key, sizeof(key), "%s|%u|%d|%llu|%s|%d",
+                 fmt_desc, fid, pending,
+                 (unsigned long long)atomic_load(&st->underrun_count),
+                 spill_note, atomic_load(&st->paused) ? 1 : 0);
     }
 
     uint64_t now = mono_ns();
-    int changed = strcmp(line, last) != 0;
-    int heartbeat = (now - last_ns) > 10ull * 1000000000ull;
-    if (!force && !changed && !heartbeat) return;
-
-    snprintf(last, sizeof(last), "%s", line);
-    last_ns = now;
-    fprintf(stderr, "%s\n", line);
+    int changed = strcmp(key, last_key) != 0;
+    /* No heartbeat while idle. A daemon nobody is playing to has nothing to
+     * report, and a line every 30s all night is the same noise more slowly. */
+    int heartbeat = open_ && (now - last_ns) > 30ull * 1000000000ull;
+    if (force || changed || heartbeat) {
+        snprintf(last_key, sizeof(last_key), "%s", key);
+        last_ns = now;
+        fprintf(stderr, "%s\n", line);
+    }
 
     /* Same information as the log line, in a form a display can parse.
-     * Written on the same change-or-heartbeat cadence, so a display polling
-     * this file (or watching it with inotify) sees every transition without
-     * the daemon doing extra work when nothing is happening. */
+     * Written every tick rather than on the log's cadence: this lands in
+     * RuntimeDirectory, which is tmpfs, so it costs no SD-card writes, and a
+     * display polling it should show the position moving even during the
+     * long stretches where the journal has nothing new to say. */
     char json[512];
     int n;
     if (!open_) {
@@ -678,11 +735,23 @@ static void report_status(halo_state_t *st, int force) {
 
 /* ---------------- Position reporting thread ---------------- */
 
+/* POSITION every 50ms, status every 200ms.
+ *
+ * These were one tick, and 200ms was chosen for the status line's sake. But
+ * POSITION is what drives the sender's playhead, so after a seek the bar
+ * could not move until the next tick — up to 200ms of a frozen seek bar
+ * stacked on top of however long the sender's own decoder took to
+ * reposition. The message is 20 bytes; sending it four times as often is
+ * free, and the status line has no reason to follow it. */
+#define POSITION_TICK_US 50000
+#define STATUS_EVERY_N_TICKS 4
+
 static void *position_thread(void *arg) {
     halo_state_t *st = (halo_state_t *)arg;
+    unsigned tick = 0;
     while (atomic_load(&st->running)) {
-        usleep(200000);
-        report_status(st, 0);
+        usleep(POSITION_TICK_US);
+        if (tick++ % STATUS_EVERY_N_TICKS == 0) report_status(st, 0);
         pthread_mutex_lock(&st->state_mtx);
         int stream_open = st->stream_open;
         uint32_t fid = st->format_id[st->active_idx];
@@ -694,8 +763,22 @@ static void *position_thread(void *arg) {
             .frames_written = atomic_load(&st->frames_written),
             .mono_ns = mono_ns(),
         };
-        halo_send_message(st->sockfd, &st->send_mtx, HALO_MSG_POSITION, &pos, sizeof(pos),
-                           atomic_fetch_add(&st->seq_counter, 1));
+        if (halo_send_message(st->sockfd, &st->send_mtx, HALO_MSG_POSITION, &pos,
+                              sizeof(pos), atomic_fetch_add(&st->seq_counter, 1)) < 0) {
+            /* halo_write_full says "dropping connection" when a peer stops
+             * reading for 60s — but nothing here dropped it. This thread
+             * discarded the failure and tried again 200ms later, so an
+             * unresponsive client got re-diagnosed once a minute, forever,
+             * while the reader stayed blocked behind the same send lock.
+             * Observed three times in a row on real hardware before the
+             * client happened to reconnect on its own.
+             *
+             * shutdown() is what actually ends it: it wakes the reader, which
+             * owns teardown, instead of duplicating that logic here. */
+            fprintf(stderr, "halo: position send failed, closing connection\n");
+            shutdown(st->sockfd, SHUT_RDWR);
+            return NULL;
+        }
     }
     return NULL;
 }
@@ -918,12 +1001,9 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
      * in the other ring with switch_requested set reuses the writer
      * thread's switch machinery (the active ring was just cleared, so it
      * flips essentially immediately, reopening ALSA only if the format
-     * actually differs). Note ALSA's own already-submitted buffer still
-     * drains (~a period or two); dropping that too would need
-     * snd_pcm_drop, which FLUSH does — acceptable for a track cut.
-     * frames_written resets at the flip (new position epoch), and paused
-     * state clears: announcing a fresh active stream is an unambiguous
-     * statement of intent to play it. */
+     * actually differs). frames_written resets at the flip (new position
+     * epoch), and paused state clears: announcing a fresh active stream is
+     * an unambiguous statement of intent to play it. */
     int other = 1 - st->active_idx;
     /* Same reason FLUSH bumps it: the writer may already hold bytes copied
      * out of the ring we are about to clear, and those belong to the
@@ -938,6 +1018,25 @@ static void handle_format(halo_state_t *st, const struct halo_format *fmt) {
     atomic_store(&st->paused, 0);
     atomic_store(&st->last_active_data_ns, mono_ns());
     pthread_mutex_unlock(&st->state_mtx);
+
+    /* Drop what ALSA already holds, exactly as FLUSH does. This used to be
+     * left to drain on the grounds that a period or two of the abandoned
+     * track was acceptable at a manual skip — but the cost was not the
+     * audio, it was the bookkeeping. Both rings are now empty, so the
+     * device plays its remaining buffer out and underruns before the new
+     * track's first bytes arrive. Every single skip therefore logged
+     * "ALSA underrun (-EPIPE), recovering" and incremented the count the
+     * daemon reports to the sender, which the app displays as "Dropouts
+     * reported by endpoint" — a real dropout counter that ticked once per
+     * deliberate track change and so meant nothing.
+     *
+     * Dropping instead leaves the device PREPARED rather than RUNNING, so
+     * there is no tail to starve and nothing to recover from: the next
+     * write simply starts the stream. */
+    pthread_mutex_lock(&st->alsa_mtx);
+    halo_alsa_drop_and_prepare(&st->alsa);
+    pthread_mutex_unlock(&st->alsa_mtx);
+
     fprintf(stderr, "halo: hard-cut FORMAT mid-stream, format_id=%u\n", fmt->format_id);
 }
 
@@ -1300,7 +1399,22 @@ static void handle_metadata(halo_state_t *st, uint32_t len, int fd) {
                  album[0] ? " · " : "", album[0] ? album : "");
         if (strcmp(announcement, last_announced) != 0) {
             snprintf(last_announced, sizeof(last_announced), "%s", announcement);
-            fprintf(stderr, "halo: now playing: %s\n", announcement);
+            /* Carries the format too. The status line does print at the
+             * switch, but it lands *before* the metadata arrives and then
+             * goes quiet, so reading the journal at a track change showed a
+             * title and nothing about what was being played — the two facts
+             * belong on one line anyway. */
+            char fmt_desc[96] = "";
+            pthread_mutex_lock(&st->state_mtx);
+            int open_ = st->stream_open;
+            struct halo_format fmt = st->fmt[st->active_idx];
+            pthread_mutex_unlock(&st->state_mtx);
+            if (open_) {
+                describe_format_with_rate(&fmt, atomic_load(&st->active_alsa_rate),
+                                          fmt_desc, sizeof(fmt_desc));
+            }
+            fprintf(stderr, "halo: now playing: %s%s%s%s\n", announcement,
+                    fmt_desc[0] ? "  [" : "", fmt_desc, fmt_desc[0] ? "]" : "");
         }
     }
     print_coverart_ansi(g_media.metadata, len);

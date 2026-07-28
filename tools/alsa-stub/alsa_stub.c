@@ -35,7 +35,23 @@ int snd_pcm_close(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_prepare(snd_pcm_t *p) { p->epoch++; p->state = STUB_PREPARED; return 0; }
 int snd_pcm_nonblock(snd_pcm_t *p, int nonblock) { (void)p; (void)nonblock; return 0; }
 /* RUNNING once anything has been written, matching the state machine above. */
-snd_pcm_state_t snd_pcm_state(snd_pcm_t *p) { return p->state == STUB_RUNNING ? SND_PCM_STATE_RUNNING : 0; }
+/* Reports the real state name rather than collapsing everything that is not
+ * RUNNING to OPEN: the drain path now distinguishes PREPARED (a tail that was
+ * written but never reached the start threshold) from the rest, and it cannot
+ * be exercised against a stub that never says PREPARED. */
+snd_pcm_state_t snd_pcm_state(snd_pcm_t *p) {
+    switch (p->state) {
+    case STUB_PREPARED: return SND_PCM_STATE_PREPARED;
+    case STUB_RUNNING:  return SND_PCM_STATE_RUNNING;
+    default:            return SND_PCM_STATE_SETUP;
+    }
+}
+
+int snd_pcm_start(snd_pcm_t *p) {
+    if (p->state != STUB_PREPARED) return -EBADFD;
+    p->state = STUB_RUNNING;
+    return 0;
+}
 int snd_pcm_drain(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_drop(snd_pcm_t *p) { p->epoch++; p->state = STUB_SETUP; return 0; }
 int snd_pcm_resume(snd_pcm_t *p) { p->epoch++; p->state = STUB_PREPARED; return 0; }
@@ -76,6 +92,12 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigne
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int *v, int *d) { (void)p;(void)h;(void)d; (void)v; return 0; }
 int snd_pcm_hw_params_set_buffer_time_near(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int *v, int *d) { (void)p;(void)h;(void)v;(void)d; return 0; }
 int snd_pcm_hw_params_set_periods_near(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int *v, int *d) { (void)p;(void)h;(void)v;(void)d; return 0; }
+
+int snd_pcm_hw_params_set_period_time_near(snd_pcm_t *p, snd_pcm_hw_params_t *h,
+                                           unsigned int *val, int *dir) {
+    (void)p; (void)h; (void)val; (void)dir;
+    return 0;
+}
 int snd_pcm_hw_params_get_period_size(const snd_pcm_hw_params_t *h, snd_pcm_uframes_t *v, int *d) { (void)h;(void)d; *v = 1024; return 0; }
 int snd_pcm_hw_params_get_buffer_size(const snd_pcm_hw_params_t *h, snd_pcm_uframes_t *v) { (void)h; *v = 8192; return 0; }
 int snd_pcm_hw_params_get_rate_min(const snd_pcm_hw_params_t *h, unsigned int *v, int *d) { (void)h;(void)d; *v = 44100; return 0; }
@@ -84,3 +106,56 @@ int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *h, unsigned in
 int snd_pcm_set_chmap(snd_pcm_t *p, const snd_pcm_chmap_t *m) { (void)p; (void)m; return 0; }
 const char *snd_pcm_format_name(snd_pcm_format_t f) { (void)f; return "STUB_FORMAT"; }
 const char *snd_strerror(int e) { (void)e; return "stub error"; }
+
+const char *snd_pcm_state_name(snd_pcm_state_t state) {
+    switch (state) {
+    case SND_PCM_STATE_OPEN:     return "OPEN";
+    case SND_PCM_STATE_SETUP:    return "SETUP";
+    case SND_PCM_STATE_PREPARED: return "PREPARED";
+    case SND_PCM_STATE_RUNNING:  return "RUNNING";
+    case SND_PCM_STATE_XRUN:     return "XRUN";
+    case SND_PCM_STATE_DRAINING: return "DRAINING";
+    case SND_PCM_STATE_PAUSED:   return "PAUSED";
+    default:                     return "UNKNOWN";
+    }
+}
+
+int snd_pcm_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp) {
+    (void)pcm;
+    if (delayp) *delayp = 0;
+    return 0;
+}
+
+/* ---- sw_params ----
+ *
+ * Only start_threshold carries behaviour here: the daemon sets it so a
+ * freshly prepared stream waits for a full buffer instead of starting on the
+ * first frame and starving. The stub consumes instantly and so can never
+ * underrun, which means it cannot reproduce that failure — it can only check
+ * that the daemon still asks for the threshold that prevents it. */
+static snd_pcm_uframes_t g_start_threshold;
+
+snd_pcm_uframes_t snd_stub_start_threshold(void) { return g_start_threshold; }
+
+int snd_pcm_sw_params_current(snd_pcm_t *pcm, snd_pcm_sw_params_t *params) {
+    (void)pcm; (void)params;
+    return 0;
+}
+
+int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params,
+                                          snd_pcm_uframes_t val) {
+    (void)pcm; (void)params;
+    g_start_threshold = val;
+    return 0;
+}
+
+int snd_pcm_sw_params_set_avail_min(snd_pcm_t *pcm, snd_pcm_sw_params_t *params,
+                                    snd_pcm_uframes_t val) {
+    (void)pcm; (void)params; (void)val;
+    return 0;
+}
+
+int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params) {
+    (void)pcm; (void)params;
+    return 0;
+}

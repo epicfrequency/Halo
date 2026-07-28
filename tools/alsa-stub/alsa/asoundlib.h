@@ -30,8 +30,28 @@ typedef int snd_pcm_stream_t;
 #define SND_PCM_FORMAT_DSD_U16_BE 51
 #define SND_PCM_FORMAT_DSD_U32_BE 52
 
+/* Lets a test tell the two apart: the stub exposes hooks real ALSA has no
+ * equivalent for, and check-linux compiles the same test against the real
+ * headers. */
+#define HALO_ALSA_STUB 1
+
 /* Real ALSA declares this as a macro that stack-allocates. */
 #define snd_pcm_hw_params_alloca(ptr) do { *(ptr) = alloca(64); memset(*(ptr), 0, 64); } while (0)
+
+typedef struct snd_pcm_sw_params snd_pcm_sw_params_t;
+#define snd_pcm_sw_params_alloca(ptr) do { *(ptr) = alloca(64); memset(*(ptr), 0, 64); } while (0)
+
+int snd_pcm_sw_params_current(snd_pcm_t *pcm, snd_pcm_sw_params_t *params);
+int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params,
+                                          snd_pcm_uframes_t val);
+int snd_pcm_sw_params_set_avail_min(snd_pcm_t *pcm, snd_pcm_sw_params_t *params,
+                                    snd_pcm_uframes_t val);
+int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params);
+int snd_pcm_start(snd_pcm_t *pcm);
+
+/* The stub records what the daemon asked for so a test can assert it, rather
+ * than only that the calls did not fail. */
+snd_pcm_uframes_t snd_stub_start_threshold(void);
 
 int snd_pcm_open(snd_pcm_t **pcm, const char *name, snd_pcm_stream_t stream, int mode);
 int snd_pcm_close(snd_pcm_t *pcm);
@@ -50,6 +70,7 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, 
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir);
 int snd_pcm_hw_params_set_buffer_time_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir);
 int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir);
+int snd_pcm_hw_params_set_period_time_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir);
 int snd_pcm_hw_params_get_period_size(const snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val, int *dir);
 int snd_pcm_hw_params_get_buffer_size(const snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val);
 int snd_pcm_hw_params_get_rate_min(const snd_pcm_hw_params_t *params, unsigned int *val, int *dir);
@@ -59,8 +80,19 @@ int snd_pcm_set_chmap(snd_pcm_t *pcm, const snd_pcm_chmap_t *map);
 const char *snd_pcm_format_name(snd_pcm_format_t format);
 int snd_pcm_nonblock(snd_pcm_t *p, int nonblock);
 typedef int snd_pcm_state_t;
+/* Real ALSA's numbering, so a value printed under the stub means the same
+ * thing as one printed on the Pi. */
+#define SND_PCM_STATE_OPEN 0
+#define SND_PCM_STATE_SETUP 1
+#define SND_PCM_STATE_PREPARED 2
 #define SND_PCM_STATE_RUNNING 3
+#define SND_PCM_STATE_XRUN 4
 #define SND_PCM_STATE_DRAINING 5
+#define SND_PCM_STATE_PAUSED 6
+#define SND_PCM_STATE_SUSPENDED 7
+#define SND_PCM_STATE_DISCONNECTED 8
+const char *snd_pcm_state_name(snd_pcm_state_t state);
+int snd_pcm_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp);
 snd_pcm_state_t snd_pcm_state(snd_pcm_t *p);
 const char *snd_strerror(int errnum);
 
