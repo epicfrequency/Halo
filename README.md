@@ -71,6 +71,14 @@ cat /proc/asound/card0/stream0
 A device that lists no `DSD_*` altset has no native DSD at all — use DoP or
 PCM in the sender's HALO DSD Mode. `S32_LE` alone is normal and fine.
 
+DoP needs nothing from this daemon beyond 32-bit PCM at the DoP frame rate:
+the sender transmits finished containers, markers and all, and the DAC is
+what decodes them. So there is no DoP encoder here to be missing, and
+`supports_dop` in CAPS is answered from the device — a 32-bit format plus
+enough rate headroom for DSD64 over DoP (176.4 kHz). It used to be hardcoded
+to 0, which made the sender refuse every DoP track against hardware that
+would have played it, blaming the DSD Mode setting rather than this.
+
 ## Running alongside MPD (or any other ALSA player)
 
 No conflict in service name, port (5555 vs MPD's 6600), Avahi service type,
@@ -280,14 +288,6 @@ on real hardware to confirm it actually announces.
 
 ## What's a stub / explicitly not implemented
 
-- **DoP (DSD-over-PCM) encoding** (`HALO_FMT_DSD_DOP` in the protocol) is
-  wired up structurally (format negotiation, rate math) but the actual
-  0x05/0xFA marker-byte interleaving is **not implemented** —
-  `pcm_format_for()` / `alsa_rate_for()` treat it as a 32-bit PCM container
-  without writing the markers. Given your Pi5 setup confirmed native DSD
-  support, this was deprioritized. If you ever need DoP for a different
-  DAC, that's the one piece of real DSP work left — everything else in the
-  daemon is agnostic to it.
 - **mDNS/discovery**: the sender is expected to know the Pi5's IP. Layer
   Avahi/Bonjour advertisement on top later if needed — it wouldn't touch
   this protocol at all, just how the sender learns the IP before dialing.

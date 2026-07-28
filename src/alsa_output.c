@@ -59,9 +59,10 @@ size_t halo_format_frame_size(const struct halo_format *fmt) {
         return (size_t)fmt->channels;
     }
     if (fmt->is_dsd == HALO_FMT_DSD_DOP) {
-        /* DoP container: not fully wired up yet (marker byte interleaving
-         * TODO — see README "DoP is a stub" note). Assumes 32-bit
-         * container per channel for now. */
+        /* One 32-bit container per channel. The daemon never builds DoP
+         * itself — the sender transmits finished containers, markers and all,
+         * and the DAC is what decodes them — so from here DoP is ordinary
+         * 32-bit PCM at the DoP frame rate. */
         return (size_t)fmt->channels * 4;
     }
     switch (fmt->bits_per_sample) {
@@ -120,10 +121,12 @@ static unsigned int alsa_rate_for(const struct halo_format *fmt) {
         return (unsigned int)(fmt->sample_rate / bpf);
     }
     if (fmt->is_dsd == HALO_FMT_DSD_DOP) {
-        /* DoP packs 2 bytes of DSD payload per 24-bit word (see
-         * PROTOCOL.md); unverified without real DoP hardware, treat as
-         * approximate until tested. */
-        return (unsigned int)(fmt->sample_rate / 2);
+        /* Already the PCM frame rate. DoP carries 16 DSD bits per frame, and
+         * the wire field is defined as bit_rate/16 — so DSD64 arrives as
+         * 176400, which is exactly what the device must run at. The earlier
+         * extra /2 here opened it at half that and played everything at half
+         * speed. */
+        return fmt->sample_rate;
     }
     return fmt->sample_rate;
 }
@@ -213,7 +216,18 @@ int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
         }
     }
     caps_out->supports_native_dsd = (uint8_t)any_dsd;
-    caps_out->supports_dop = 0; /* not implemented yet, see README */
+    /* DoP needs nothing from this daemon beyond 32-bit PCM at the DoP frame
+     * rate: the sender packs the containers and the DAC decodes them, so
+     * there is no encoder here to be missing. Reporting 0 unconditionally —
+     * as this did — made the sender refuse every DoP track against hardware
+     * that would have played it fine, with a message pointing at the DSD Mode
+     * setting rather than at the daemon.
+     *
+     * Answer it from the device: a 32-bit format, and enough rate headroom
+     * for at least DSD64 over DoP (2822400/16). */
+    int dop_capable = snd_pcm_hw_params_test_format(pcm, params, SND_PCM_FORMAT_S32_LE) == 0
+                      && rate_max >= 176400u;
+    caps_out->supports_dop = (uint8_t)(dop_capable ? 1 : 0);
     caps_out->supported_dsd_rates_mask = dsd_mask;
 
     snd_pcm_close(pcm);

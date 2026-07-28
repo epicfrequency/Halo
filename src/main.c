@@ -536,17 +536,39 @@ static int write_file_atomic(const char *name, const void *data, size_t len) {
  * wire encodes it. The wire `sample_rate` for DSD is a per-channel byte
  * rate (bit rate / 8 native, / 16 DoP) — printing that raw shows "352800"
  * for DSD64, which reads like 352.8 kHz PCM and is nobody's mental model. */
+/* `alsa_rate` is the rate the device is actually clocked at, which for DSD
+ * and DoP is not the number in the format name: DSD64 native runs the card at
+ * 88.2 kHz under DSD_U32 packing, and DSD64 over DoP runs it at 176.4 kHz of
+ * ordinary PCM. Both are worth showing — the DSD figure says what the music
+ * is, the carrier rate says what the hardware was asked to do, and only the
+ * second one can be checked against `aplay --dump-hw-params` or the DAC's own
+ * display when something disagrees. Pass 0 to omit it. */
+static void describe_format_with_rate(const struct halo_format *fmt,
+                                       unsigned int alsa_rate,
+                                       char *out, size_t out_len);
+
 static void describe_format(const struct halo_format *fmt, char *out, size_t out_len) {
+    describe_format_with_rate(fmt, 0u, out, out_len);
+}
+
+static void describe_format_with_rate(const struct halo_format *fmt,
+                                       unsigned int alsa_rate,
+                                       char *out, size_t out_len) {
+    char carrier[32] = "";
+    if (alsa_rate > 0 && fmt->is_dsd != HALO_FMT_PCM) {
+        snprintf(carrier, sizeof(carrier), " @ %.1f kHz", (double)alsa_rate / 1000.0);
+    }
+
     if (fmt->is_dsd == HALO_FMT_DSD_NATIVE) {
         double mhz = (double)fmt->sample_rate * 8.0 / 1e6;
-        snprintf(out, out_len, "DSD%u native 1-bit %.3f MHz %uch",
+        snprintf(out, out_len, "DSD%u native 1-bit %.3f MHz%s %uch",
                  64u * (fmt->dsd_rate_mult ? fmt->dsd_rate_mult : 1),
-                 mhz, fmt->channels);
+                 mhz, carrier, fmt->channels);
     } else if (fmt->is_dsd == HALO_FMT_DSD_DOP) {
         double mhz = (double)fmt->sample_rate * 16.0 / 1e6;
-        snprintf(out, out_len, "DSD%u over DoP 1-bit %.3f MHz %uch",
+        snprintf(out, out_len, "DSD%u over DoP 1-bit %.3f MHz%s %uch",
                  64u * (fmt->dsd_rate_mult ? fmt->dsd_rate_mult : 1),
-                 mhz, fmt->channels);
+                 mhz, carrier, fmt->channels);
     } else {
         snprintf(out, out_len, "PCM %u-bit %.1f kHz %uch",
                  fmt->bits_per_sample, (double)fmt->sample_rate / 1000.0, fmt->channels);
@@ -574,7 +596,11 @@ static void report_status(halo_state_t *st, int force) {
         snprintf(line, sizeof(line), "[halo] idle — no stream open");
     } else {
         char fmt_desc[96];
-        describe_format(&fmt, fmt_desc, sizeof(fmt_desc));
+        /* The device's own clock, not the wire rate below — those differ for
+         * DSD and DoP, and this is the one that can be checked against the
+         * hardware. */
+        describe_format_with_rate(&fmt, atomic_load(&st->active_alsa_rate),
+                                  fmt_desc, sizeof(fmt_desc));
 
         size_t used = halo_ring_used(&st->ring[idx]);
         unsigned ring_pct = (unsigned)((used * 100) / RING_CAPACITY);
