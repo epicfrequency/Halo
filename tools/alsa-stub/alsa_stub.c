@@ -71,6 +71,7 @@ int snd_pcm_hw_params_any(snd_pcm_t *p, snd_pcm_hw_params_t *h) { (void)p; (void
 int snd_pcm_hw_params_set_access(snd_pcm_t *p, snd_pcm_hw_params_t *h, snd_pcm_access_t a) { (void)p;(void)h;(void)a; return 0; }
 int snd_pcm_hw_params_set_format(snd_pcm_t *p, snd_pcm_hw_params_t *h, snd_pcm_format_t f) { (void)p;(void)h;(void)f; return 0; }
 int snd_pcm_hw_params_test_format(snd_pcm_t *p, snd_pcm_hw_params_t *h, snd_pcm_format_t f) { (void)p;(void)h;(void)f; return 0; }
+int snd_pcm_hw_params_test_rate(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int rate, int dir) { (void)p;(void)h;(void)rate;(void)dir; return 0; }
 int snd_pcm_hw_params_set_channels(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int v) { (void)p;(void)h;(void)v; return 0; }
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int *v, int *d) { (void)p;(void)h;(void)d; (void)v; return 0; }
 int snd_pcm_hw_params_set_buffer_time_near(snd_pcm_t *p, snd_pcm_hw_params_t *h, unsigned int *v, int *d) { (void)p;(void)h;(void)v;(void)d; return 0; }

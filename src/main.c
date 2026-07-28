@@ -720,16 +720,43 @@ static void write_caps_json(const char *device, const struct halo_caps *c) {
         }
     }
 
-    char json[512];
+    /* The enumerated lists sit alongside the maxima rather than replacing
+     * them: the maxima are what the sender negotiates against, the lists are
+     * what somebody looks at when a format is refused and the maximum says it
+     * should have worked. */
+    const halo_device_report_t *report = halo_alsa_last_device_report();
+
+    char pcm_rates[192] = "";
+    size_t rn = 0;
+    for (size_t i = 0; i < report->pcm_rate_count; i++) {
+        rn += (size_t)snprintf(pcm_rates + rn, sizeof(pcm_rates) - rn, "%s%u",
+                               rn ? "," : "", report->pcm_rates[i]);
+    }
+    char pcm_formats[128] = "";
+    size_t fn = 0;
+    for (size_t i = 0; i < report->pcm_format_count; i++) {
+        fn += (size_t)snprintf(pcm_formats + fn, sizeof(pcm_formats) - fn, "%s\"%s\"",
+                               fn ? "," : "", report->pcm_formats[i]);
+    }
+    char dsd_formats[160] = "";
+    size_t dn = 0;
+    for (size_t i = 0; i < report->dsd_format_count; i++) {
+        dn += (size_t)snprintf(dsd_formats + dn, sizeof(dsd_formats) - dn, "%s\"%s\"",
+                               dn ? "," : "", report->dsd_formats[i]);
+    }
+
+    char json[1024];
     int len = snprintf(json, sizeof(json),
         "{\"device\":\"%s\",\"max_sample_rate_pcm\":%u,"
         "\"max_bits_per_sample\":%u,\"max_channels\":%u,"
         "\"supports_native_dsd\":%s,\"supports_dop\":%s,"
-        "\"dsd_rates\":[%s],\"feature_flags\":%u}\n",
+        "\"dsd_rates\":[%s],\"feature_flags\":%u,"
+        "\"pcm_rates\":[%s],\"pcm_formats\":[%s],\"dsd_formats\":[%s]}\n",
         device, c->max_sample_rate_pcm, c->max_bits_per_sample, c->max_channels,
         c->supports_native_dsd ? "true" : "false",
         c->supports_dop ? "true" : "false",
-        rates, c->feature_flags);
+        rates, c->feature_flags,
+        pcm_rates, pcm_formats, dsd_formats);
     if (len > 0) write_file_atomic("caps.json", json, (size_t)len);
 }
 
@@ -767,6 +794,14 @@ static void handle_hello(halo_state_t *st) {
         caps.max_channels = 2;
         caps.supports_native_dsd = 0; /* unknown: don't claim what we couldn't verify */
         caps.supported_dsd_rates_mask = 0;
+        /* Left at zero deliberately. The masks mean "not reported" when
+         * absent, and a reader must not read that as "supports nothing" —
+         * inventing a plausible-looking list here would turn an honest "we
+         * could not probe" into a confident lie, which is worse than the
+         * blanket permissiveness the maxima above already grant. */
+        caps.pcm_rate_mask = 0;
+        caps.pcm_format_mask = 0;
+        caps.dsd_format_mask = 0;
     }
     /* Advertise what this build actually implements, so a sender can tell
      * us apart from an original v1 daemon (which sends a 16-byte CAPS with
@@ -774,6 +809,33 @@ static void handle_hello(halo_state_t *st) {
     caps.feature_flags = HALO_FEATURE_FORMAT_REJECTED
                        | HALO_FEATURE_PING
                        | HALO_FEATURE_SKIPS_UNKNOWN;
+    {
+        /* Printed once per connection, next to the "device accepts native DSD
+         * as ..." line, so a refused format can be checked against what the
+         * device actually offers without running aplay by hand. */
+        const halo_device_report_t *report = halo_alsa_last_device_report();
+        char line[320];
+        size_t n = 0;
+        for (size_t i = 0; i < report->pcm_rate_count && n < sizeof(line); i++) {
+            n += (size_t)snprintf(line + n, sizeof(line) - n, "%s%.1f",
+                                  n ? "/" : "", report->pcm_rates[i] / 1000.0);
+        }
+        fprintf(stderr, "halo: device PCM rates (kHz): %s\n", n ? line : "none");
+
+        n = 0;
+        for (size_t i = 0; i < report->pcm_format_count && n < sizeof(line); i++) {
+            n += (size_t)snprintf(line + n, sizeof(line) - n, "%s%s",
+                                  n ? " " : "", report->pcm_formats[i]);
+        }
+        fprintf(stderr, "halo: device PCM formats: %s\n", n ? line : "none");
+
+        n = 0;
+        for (size_t i = 0; i < report->dsd_format_count && n < sizeof(line); i++) {
+            n += (size_t)snprintf(line + n, sizeof(line) - n, "%s%s",
+                                  n ? " " : "", report->dsd_formats[i]);
+        }
+        fprintf(stderr, "halo: device DSD formats: %s\n", n ? line : "none");
+    }
     write_caps_json(st->alsa_device, &caps);
     halo_send_message(st->sockfd, &st->send_mtx, HALO_MSG_CAPS, &caps, sizeof(caps),
                        atomic_fetch_add(&st->seq_counter, 1));

@@ -131,6 +131,38 @@ static unsigned int alsa_rate_for(const struct halo_format *fmt) {
     return fmt->sample_rate;
 }
 
+static halo_device_report_t g_device_report;
+
+const halo_device_report_t *halo_alsa_last_device_report(void) {
+    return &g_device_report;
+}
+
+/* The rates a hi-res DAC might expose, both families. Probed individually
+ * because `rate_min`/`rate_max` describe a range and USB DACs do not offer
+ * ranges — they offer a list, sometimes with holes in it. */
+static const struct { unsigned int rate; uint16_t bit; } k_probe_rates[] = {
+    {  44100, HALO_PCM_RATE_44100  }, {  48000, HALO_PCM_RATE_48000  },
+    {  88200, HALO_PCM_RATE_88200  }, {  96000, HALO_PCM_RATE_96000  },
+    { 176400, HALO_PCM_RATE_176400 }, { 192000, HALO_PCM_RATE_192000 },
+    { 352800, HALO_PCM_RATE_352800 }, { 384000, HALO_PCM_RATE_384000 },
+    { 705600, HALO_PCM_RATE_705600 }, { 768000, HALO_PCM_RATE_768000 },
+};
+
+static const struct { snd_pcm_format_t format; const char *name; uint8_t bit; } k_probe_pcm[] = {
+    { SND_PCM_FORMAT_S16_LE,  "S16_LE",  HALO_PCM_FMT_S16_LE  },
+    { SND_PCM_FORMAT_S24_3LE, "S24_3LE", HALO_PCM_FMT_S24_3LE },
+    { SND_PCM_FORMAT_S24_LE,  "S24_LE",  HALO_PCM_FMT_S24_LE  },
+    { SND_PCM_FORMAT_S32_LE,  "S32_LE",  HALO_PCM_FMT_S32_LE  },
+};
+
+static const struct { snd_pcm_format_t format; const char *name; uint8_t bit; } k_probe_dsd[] = {
+    { SND_PCM_FORMAT_DSD_U32_BE, "DSD_U32_BE", HALO_DSD_FMT_U32_BE },
+    { SND_PCM_FORMAT_DSD_U32_LE, "DSD_U32_LE", HALO_DSD_FMT_U32_LE },
+    { SND_PCM_FORMAT_DSD_U16_BE, "DSD_U16_BE", HALO_DSD_FMT_U16_BE },
+    { SND_PCM_FORMAT_DSD_U16_LE, "DSD_U16_LE", HALO_DSD_FMT_U16_LE },
+    { SND_PCM_FORMAT_DSD_U8,     "DSD_U8",     HALO_DSD_FMT_U8     },
+};
+
 int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
     snd_pcm_t *pcm = NULL;
     snd_pcm_hw_params_t *params = NULL;
@@ -215,6 +247,29 @@ int halo_alsa_query_caps(const char *device_name, struct halo_caps *caps_out) {
             }
         }
     }
+    /* Enumerate for the log and caps.json. Uses the same untouched params as
+     * the probes above, so every answer is about the device rather than about
+     * a configuration already narrowed by an earlier call. */
+    memset(&g_device_report, 0, sizeof(g_device_report));
+    for (size_t i = 0; i < sizeof(k_probe_rates) / sizeof(k_probe_rates[0]); i++) {
+        if (snd_pcm_hw_params_test_rate(pcm, params, k_probe_rates[i].rate, 0) == 0) {
+            g_device_report.pcm_rates[g_device_report.pcm_rate_count++] = k_probe_rates[i].rate;
+            caps_out->pcm_rate_mask |= k_probe_rates[i].bit;
+        }
+    }
+    for (size_t i = 0; i < sizeof(k_probe_pcm) / sizeof(k_probe_pcm[0]); i++) {
+        if (snd_pcm_hw_params_test_format(pcm, params, k_probe_pcm[i].format) == 0) {
+            g_device_report.pcm_formats[g_device_report.pcm_format_count++] = k_probe_pcm[i].name;
+            caps_out->pcm_format_mask |= k_probe_pcm[i].bit;
+        }
+    }
+    for (size_t i = 0; i < sizeof(k_probe_dsd) / sizeof(k_probe_dsd[0]); i++) {
+        if (snd_pcm_hw_params_test_format(pcm, params, k_probe_dsd[i].format) == 0) {
+            g_device_report.dsd_formats[g_device_report.dsd_format_count++] = k_probe_dsd[i].name;
+            caps_out->dsd_format_mask |= k_probe_dsd[i].bit;
+        }
+    }
+
     caps_out->supports_native_dsd = (uint8_t)any_dsd;
     /* DoP needs nothing from this daemon beyond 32-bit PCM at the DoP frame
      * rate: the sender packs the containers and the DAC decodes them, so

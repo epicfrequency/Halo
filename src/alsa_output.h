@@ -29,6 +29,25 @@ typedef struct {
     size_t convert_buf_bytes;
 } halo_alsa_ctx_t;
 
+/* Everything the device accepts, enumerated rather than summarised.
+ *
+ * The wire CAPS carries maxima because that is all a sender needs to decide
+ * whether a track can play. A maximum cannot describe a gap, though — a DAC
+ * that takes 44.1/48/96/192 but not 88.2 reports the same 192000 as one that
+ * takes every rate — so the daemon keeps the full picture for its own log and
+ * for caps.json, where somebody diagnosing a refused format can see it. */
+typedef struct {
+    unsigned int pcm_rates[16];
+    size_t       pcm_rate_count;
+    const char  *pcm_formats[8];
+    size_t       pcm_format_count;
+    const char  *dsd_formats[8];
+    size_t       dsd_format_count;
+} halo_device_report_t;
+
+/* Filled by the most recent halo_alsa_query_caps. Valid until the next call. */
+const halo_device_report_t *halo_alsa_last_device_report(void);
+
 /* Queries the device without fixing a format, to build the CAPS message.
  * best-effort: not every driver reports DSD support cleanly, so
  * supports_native_dsd/supported_dsd_rates_mask may need a config override

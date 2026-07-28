@@ -310,7 +310,7 @@ without playback noticing.
 | file (in `/run/halo-daemon`, tmpfs — no SD-card writes) | written from |
 |---|---|
 | `status.json` | live: format, both rates, position, ring, underruns |
-| `caps.json` | what the device reported at connect |
+| `caps.json` | what the device reported at connect — maxima for negotiation, plus `pcm_rates`/`pcm_formats`/`dsd_formats` enumerated, since a maximum cannot show a gap |
 | `metadata.json` | sender's METADATA, verbatim (track, album, track list, source) |
 | `coverart.bin` | sender's COVERART, image bytes as sent (JPEG in practice) |
 | `coverart.sha256` | digest of the above, matching `metadata.json`'s `coverart_sha256` |

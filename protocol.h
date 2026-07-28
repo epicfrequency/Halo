@@ -84,8 +84,45 @@ struct halo_caps {
     uint8_t  _pad;
     uint32_t supported_dsd_rates_mask;
     uint32_t feature_flags;   /* added after v1; absent == 0 */
+
+    /* Which discrete rates and formats the device actually takes, as bit
+     * masks. Maxima alone cannot describe a gap: a DAC that accepts
+     * 44.1/48/96/192 but not 88.2 reports the same 192000 as one that accepts
+     * everything, and a DAC offering only S32_LE reports the same "32 bits" as
+     * one that also offers 16 and 24. Both cases are real and both were
+     * diagnosed the slow way before these existed. A sender negotiates on the
+     * maxima above; these are for telling a listener *why* something was
+     * refused. Added after v1 — absent means zero, which readers must treat as
+     * "not reported" rather than "supports nothing". */
+    uint16_t pcm_rate_mask;   /* HALO_PCM_RATE_* */
+    uint8_t  pcm_format_mask; /* HALO_PCM_FMT_* */
+    uint8_t  dsd_format_mask; /* HALO_DSD_FMT_* */
 };
 #define HALO_CAPS_MIN_SIZE 16
+
+/* Bit positions for halo_caps.pcm_rate_mask, both rate families interleaved
+ * in ascending order. */
+#define HALO_PCM_RATE_44100   (1u << 0)
+#define HALO_PCM_RATE_48000   (1u << 1)
+#define HALO_PCM_RATE_88200   (1u << 2)
+#define HALO_PCM_RATE_96000   (1u << 3)
+#define HALO_PCM_RATE_176400  (1u << 4)
+#define HALO_PCM_RATE_192000  (1u << 5)
+#define HALO_PCM_RATE_352800  (1u << 6)
+#define HALO_PCM_RATE_384000  (1u << 7)
+#define HALO_PCM_RATE_705600  (1u << 8)
+#define HALO_PCM_RATE_768000  (1u << 9)
+
+#define HALO_PCM_FMT_S16_LE   (1u << 0)
+#define HALO_PCM_FMT_S24_3LE  (1u << 1)
+#define HALO_PCM_FMT_S24_LE   (1u << 2)
+#define HALO_PCM_FMT_S32_LE   (1u << 3)
+
+#define HALO_DSD_FMT_U32_BE   (1u << 0)
+#define HALO_DSD_FMT_U32_LE   (1u << 1)
+#define HALO_DSD_FMT_U16_BE   (1u << 2)
+#define HALO_DSD_FMT_U16_LE   (1u << 3)
+#define HALO_DSD_FMT_U8       (1u << 4)
 
 /* is_dsd values */
 #define HALO_FMT_PCM        0
