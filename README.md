@@ -386,11 +386,16 @@ customised font may not.
 
 Accurate while following, because the arrival time *is* the log time to within
 a second — but wrong for replaying history, where every line gets stamped with
-the moment awk happened to read it:
+the moment it happened to be read:
 
 ```
-ssh pi5 journalctl -u halo-daemon -f -o cat | awk '/^(halo:|\[halo\])/ {printf "%s %s\n", strftime("%H:%M:%S"), $0; fflush(); next} {print; fflush()}'
+ssh pi5 journalctl -u halo-daemon -f -o cat | perl -MPOSIX -ne '$|=1; print /^(?:halo:|\[halo\])/ ? strftime("%H:%M:%S ", localtime) . $_ : $_'
 ```
+
+Perl rather than awk because this runs on the *client*, and macOS ships the
+one-true-awk, which has no `strftime` — that is a gawk extension. The awk
+form works on the Pi and fails on the Mac you are almost certainly typing it
+from, which is a poor way to find out.
 
 Just the art, nothing else:
 
@@ -513,17 +518,37 @@ implement, in order:
 ```
 ARCHITECTURE.md            how the protocol works, and why (read this first)
 PROTOCOL.md                wire protocol spec (normative)
+README.md                  this file — install, journal, per-DAC tuning
+
 src/protocol.h             shared struct/enum definitions
 src/ring_buffer.h          lock-free SPSC ring buffer
-src/alsa_output.{h,c}      direct hw: ALSA device management
-src/net_io.h               framed-message socket helpers
-src/main.c                 TCP server, gapless state machine, threads
-tools/halo-log             journal with timestamps *and* colour (journalctl
-                           gives you one or the other, not both)
-tools/                     regression tests, each named for the bug it pins down
+src/net_io.h               framed-message socket helpers, bounded everywhere
+src/alsa_output.{h,c}      device open, DSD repacking, drain, capability probe
+src/main.c                 TCP server, gapless state machine, three threads
+
+install.sh                 build + install + enable, dependencies included
+uninstall.sh               undo it
+systemd/halo-daemon.service   unit: unprivileged user, RT capabilities, tmpfs
+avahi/halo-daemon.service     mDNS advertisement (static XML, no code)
+
+tools/halo-log             journal with timestamps *and* colour — journalctl
+                           gives you one or the other, never both
+tools/check-linux.sh       build + self-test against real libasound (aarch64)
 tools/alsa-stub/           ALSA stub with a PCM state machine, so `make check`
                            needs no sound card
-systemd/halo-daemon.service systemd unit (unprivileged user + RT capabilities)
-avahi/halo-daemon.service  mDNS/Bonjour service advertisement (static, no code)
-Makefile
+
+tools/packing_test.c       DSD packings, PCM widening, ALSA start threshold
+tools/prime_gate_test.py   playback must not start on a sliver of audio
+tools/journal_noise_test.py the status line must not flood the journal
+tools/pause_stall_test.py  the paused-and-overfull deadlock
+tools/race_stress.py       FLUSH/FORMAT storm vs the writer thread
+tools/state_fuzz.py        control messages in illegal orders
+tools/protocol_selftest.py end-to-end handshake, metadata, cover art
+tools/smoke_test_client.py throwaway protocol exerciser (not a real sender)
+
+Makefile                   make / make check / make check-linux / make install
 ```
+
+Each test in `tools/` is named for the bug it pins down, and every one of them
+was checked by removing the fix and confirming the test goes red — a test that
+has never failed has not been shown to test anything.
