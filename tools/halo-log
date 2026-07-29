@@ -24,6 +24,7 @@ Anything else is passed through to journalctl.
 """
 import datetime
 import json
+import os
 import subprocess
 import sys
 
@@ -61,7 +62,13 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     except BrokenPipeError:
-        return 0
+        # Someone downstream closed the pipe — `| head`, or quitting a pager.
+        # Catching it here is not enough on its own: the interpreter flushes
+        # stdout again on the way out and raises a second time, which prints a
+        # traceback after output the reader already stopped caring about.
+        # Pointing stdout at /dev/null first is the documented way to make
+        # that final flush a no-op.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     finally:
         proc.terminate()
     return 0

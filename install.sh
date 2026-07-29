@@ -212,6 +212,10 @@ fi
 echo "==> Installing binary to /usr/local/bin/halo-daemon"
 install -m 0755 ./halo-daemon /usr/local/bin/halo-daemon
 
+# journalctl keeps either the timestamps or the cover art's colour, never
+# both. This is the reader that does — see README, "Timestamps and colour".
+install -m 0755 ./tools/halo-log /usr/local/bin/halo-log
+
 echo "==> Writing systemd unit (device=$DEVICE port=$PORT)"
 sed -E "s#^ExecStart=.*#ExecStart=/usr/local/bin/halo-daemon ${DEVICE} ${PORT}#" \
     systemd/halo-daemon.service > /etc/systemd/system/halo-daemon.service

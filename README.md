@@ -334,18 +334,33 @@ the sender produced while making its thumbnail. The daemon prints it once per
 change and stores it with the rest of the JSON; it is optional, and a display
 with a real screen should ignore it and read `coverart.bin` instead.
 
-### Actually seeing it
+### Seeing the cover art
+
+```
+ssh pi5 halo-log -f
+```
+
+That is the whole answer; the rest of this section is why it needs a tool at
+all. `install.sh` puts `halo-log` in `/usr/local/bin` next to the daemon. It
+defaults to the last hour, and `-f`, `-n`, `--since` and anything else pass
+through to journalctl.
 
 Two things have to be right, and each fails in its own confusing way.
 
-**1. `journalctl` must not filter the escapes.** Its default output strips
+**1. The escapes must survive journalctl.** Its default formatters sanitise
 control characters, which takes the colour with it and leaves a black
-rectangle. journald's *storage* keeps them intact — it is only the default
-formatter that hides them, so `-o cat` is enough:
+rectangle. journald's *storage* keeps them — this is a formatter choice, not
+data loss. Verified rather than assumed: over a six-hour window, `short`,
+`short-precise` and `short-iso` each contained zero escape sequences, and
+`cat` contained 1400.
 
-```
-journalctl -u halo-daemon -f -o cat
-```
+So `-o cat` shows the art — and drops the timestamps along with everything
+else, which is no good when the art is only meaningful next to the track it
+belongs to. That is what `halo-log` exists for: it reads `-o json`, where
+journald hands back a message containing control bytes as a byte array with
+nothing stripped, and prints the timestamp itself. Log lines get one; the
+art's own rows do not, because forty identical timestamps down the left of a
+picture is worse than none.
 
 **2. The terminal must do 24-bit colour.** The rendering uses truecolour
 escapes (`\033[38;2;R;G;Bm`) with quadrant block glyphs, so each character
@@ -353,57 +368,57 @@ cell carries a 2×2 sub-grid in two exact colours.
 
 A terminal without truecolour does not fail loudly — it approximates to a
 256-colour palette, so a photographic cover comes out muddy and banded rather
-than obviously broken. That is the confusing part, and it is worth ruling out
-before blaming the daemon. macOS's built-in Terminal.app handles this on
-current macOS (verified on 26.5); iTerm2, Ghostty, kitty, WezTerm and
-Alacritty all do too. Older Terminal.app builds did not.
-
-Check yours — this should print a smooth gradient, not a few flat bands:
+than obviously broken. Worth ruling out before blaming the daemon. macOS's
+built-in Terminal.app handles it on current macOS (verified on 26.5); iTerm2,
+Ghostty, kitty, WezTerm and Alacritty do too. Older Terminal.app builds did
+not. Rather than trusting a list that dates, check yours — this should print a
+smooth gradient, not a few flat bands:
 
 ```
 awk 'BEGIN{for(i=0;i<77;i++){r=255-i*255/76;b=i*255/76;printf "\033[48;2;%d;0;%dm ",r,b}print "\033[0m"}'
 ```
 
-### Timestamps *and* colour
+The glyphs are U+2596–U+259F plus the halves and the full block, so the font
+needs box-drawing coverage. Every terminal above ships with it; a heavily
+customised font may not.
 
-`-o cat` is the only format that keeps the escapes — and it drops the
-timestamps along with everything else. Verified rather than assumed: over a
-six-hour window, `short`, `short-precise` and `short-iso` contained zero
-escape sequences and `cat` contained 1400.
+### If you would rather not install anything
 
-Since the art is only useful next to the track it belongs to, `tools/halo-log`
-reads `-o json` (where journald hands back a message containing control bytes
-as a byte array, intact) and prints the timestamp itself. Log lines get one;
-the art's own rows do not, because forty identical timestamps down the left of
-a picture is worse than none.
-
-```
-sudo install -m 755 tools/halo-log /usr/local/bin/
-```
-
-```
-ssh pi5 halo-log -f
-```
-
-`halo-log` defaults to the last hour; `-f`, `-n`, `--since` and anything else
-pass through to journalctl.
-
-Or, without installing anything — accurate while following, since the arrival
-time *is* the log time to within a second, but wrong for replaying history:
+Accurate while following, because the arrival time *is* the log time to within
+a second — but wrong for replaying history, where every line gets stamped with
+the moment awk happened to read it:
 
 ```
 ssh pi5 journalctl -u halo-daemon -f -o cat | awk '/^(halo:|\[halo\])/ {printf "%s %s\n", strftime("%H:%M:%S"), $0; fflush(); next} {print; fflush()}'
 ```
 
-The glyphs are U+2596–U+259F plus the halves and the full block, so the font
-needs box-drawing coverage too — every terminal above ships with it, but a
-heavily customised font may not.
-
-If you only want the art and not the rest of the log:
+Just the art, nothing else:
 
 ```
-ssh pi5 journalctl -u halo-daemon -f -o cat | grep --line-buffered -E '[▀▄█▌▐▘▝▖▗▚▞▛▜▙▟]'
+ssh pi5 halo-log -f | grep --line-buffered -E '[▀▄█▌▐▘▝▖▗▚▞▛▜▙▟]'
 ```
+
+`coverart.sha256` is worth one clarification, because a display program will
+be tempted to use it as an integrity check and it is not one: the daemon
+copies the digest out of the COVERART header and never computes its own. It is
+the sender's claim about the bytes, useful for telling one cover from the next
+— which is exactly what the daemon uses it for — and no evidence that the file
+matches it.
+
+That is deliberate rather than an omission. TCP already guarantees the bytes
+arrive in order and unmodified, and the one thing it does not guarantee —
+that they all arrive — is handled by reading the declared length or failing:
+a short read discards the image and drops the connection, so a truncated
+cover is never stored. What a digest check would add is detection of a
+*sender* contradicting itself, and a sender computes the digest from the same
+buffer it transmits.
+
+It is also worth being clear about what the digest is *not* protecting
+against. This is one sender and one receiver on a LAN — no proxies, no
+caches, no untrusted middle. A checksum earns its place where bytes cross
+something that might rewrite them; here the same reasoning that makes it
+unnecessary for the audio makes it unnecessary for the image, and the audio
+is the part that would actually matter.
 
 The daemon never decodes an image. It stores what the sender transmits and
 that is all — a JPEG decoder fed from the network has no business sharing a
@@ -417,7 +432,7 @@ without playback noticing.
 | `caps.json` | what the device reported at connect — maxima for negotiation, plus `pcm_rates`/`pcm_formats`/`dsd_formats` enumerated, since a maximum cannot show a gap |
 | `metadata.json` | sender's METADATA, verbatim (track, album, track list, source) |
 | `coverart.bin` | sender's COVERART, image bytes as sent (JPEG in practice) |
-| `coverart.sha256` | digest of the above, matching `metadata.json`'s `coverart_sha256` |
+| `coverart.sha256` | the digest the **sender declared**, stored verbatim — not recomputed here |
 
 ## Things you will likely need to tune per-DAC
 

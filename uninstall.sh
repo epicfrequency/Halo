@@ -9,7 +9,7 @@ systemctl disable halo-daemon.service 2>/dev/null || true
 
 rm -f /etc/systemd/system/halo-daemon.service
 rm -f /etc/avahi/services/halo-daemon.service
-rm -f /usr/local/bin/halo-daemon
+rm -f /usr/local/bin/halo-daemon /usr/local/bin/halo-log
 systemctl daemon-reload
 
 echo "==> Removed binary, systemd unit and Avahi advertisement."
