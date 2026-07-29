@@ -230,7 +230,7 @@ Use the DAC's own attenuator.
 | | |
 |---|---|
 | `PROTOCOL.md` | normative — wire format, message semantics, edge cases |
-| `README.md` | operating it: install, journal, per-DAC tuning |
+| `README.md` | operating it: install, journal (including how to actually see the cover art in colour), per-DAC tuning |
 | `src/main.c` | reader thread, ring routing, gapless flip |
 | `src/alsa_output.c` | device open, DSD repacking, drain |
 | `tools/` | the regression tests, each named for the bug it pins down |

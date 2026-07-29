@@ -334,11 +334,50 @@ the sender produced while making its thumbnail. The daemon prints it once per
 change and stores it with the rest of the JSON; it is optional, and a display
 with a real screen should ignore it and read `coverart.bin` instead.
 
-Note that `journalctl`'s default output filters control characters, which
-takes the colour with it and leaves a black rectangle. Use `-o cat` to see it:
+### Actually seeing it
+
+Two things have to be right, and each fails in its own confusing way.
+
+**1. `journalctl` must not filter the escapes.** Its default output strips
+control characters, which takes the colour with it and leaves a black
+rectangle. journald's *storage* keeps them intact — it is only the default
+formatter that hides them, so `-o cat` is enough:
 
 ```
 journalctl -u halo-daemon -f -o cat
+```
+
+**2. The terminal must do 24-bit colour.** The rendering uses truecolour
+escapes (`\033[38;2;R;G;Bm`) with quadrant block glyphs, so each character
+cell carries a 2×2 sub-grid in two exact colours.
+
+A terminal without truecolour does not fail loudly — it approximates to a
+256-colour palette, so a photographic cover comes out muddy and banded rather
+than obviously broken. That is the confusing part, and it is worth ruling out
+before blaming the daemon. macOS's built-in Terminal.app handles this on
+current macOS (verified on 26.5); iTerm2, Ghostty, kitty, WezTerm and
+Alacritty all do too. Older Terminal.app builds did not.
+
+Check yours — this should print a smooth gradient, not a few flat bands:
+
+```
+awk 'BEGIN{for(i=0;i<77;i++){r=255-i*255/76;b=i*255/76;printf "\033[48;2;%d;0;%dm ",r,b}print "\033[0m"}'
+```
+
+Then:
+
+```
+ssh pi5 journalctl -u halo-daemon -f -o cat
+```
+
+The glyphs are U+2596–U+259F plus the halves and the full block, so the font
+needs box-drawing coverage too — every terminal above ships with it, but a
+heavily customised font may not.
+
+If you only want the art and not the rest of the log:
+
+```
+ssh pi5 journalctl -u halo-daemon -f -o cat | grep --line-buffered -E '[▀▄█▌▐▘▝▖▗▚▞▛▜▙▟]'
 ```
 
 The daemon never decodes an image. It stores what the sender transmits and
