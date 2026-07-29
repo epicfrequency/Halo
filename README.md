@@ -364,10 +364,35 @@ Check yours — this should print a smooth gradient, not a few flat bands:
 awk 'BEGIN{for(i=0;i<77;i++){r=255-i*255/76;b=i*255/76;printf "\033[48;2;%d;0;%dm ",r,b}print "\033[0m"}'
 ```
 
-Then:
+### Timestamps *and* colour
+
+`-o cat` is the only format that keeps the escapes — and it drops the
+timestamps along with everything else. Verified rather than assumed: over a
+six-hour window, `short`, `short-precise` and `short-iso` contained zero
+escape sequences and `cat` contained 1400.
+
+Since the art is only useful next to the track it belongs to, `tools/halo-log`
+reads `-o json` (where journald hands back a message containing control bytes
+as a byte array, intact) and prints the timestamp itself. Log lines get one;
+the art's own rows do not, because forty identical timestamps down the left of
+a picture is worse than none.
 
 ```
-ssh pi5 journalctl -u halo-daemon -f -o cat
+sudo install -m 755 tools/halo-log /usr/local/bin/
+```
+
+```
+ssh pi5 halo-log -f
+```
+
+`halo-log` defaults to the last hour; `-f`, `-n`, `--since` and anything else
+pass through to journalctl.
+
+Or, without installing anything — accurate while following, since the arrival
+time *is* the log time to within a second, but wrong for replaying history:
+
+```
+ssh pi5 journalctl -u halo-daemon -f -o cat | awk '/^(halo:|\[halo\])/ {printf "%s %s\n", strftime("%H:%M:%S"), $0; fflush(); next} {print; fflush()}'
 ```
 
 The glyphs are U+2596–U+259F plus the halves and the full block, so the font
@@ -478,6 +503,8 @@ src/ring_buffer.h          lock-free SPSC ring buffer
 src/alsa_output.{h,c}      direct hw: ALSA device management
 src/net_io.h               framed-message socket helpers
 src/main.c                 TCP server, gapless state machine, threads
+tools/halo-log             journal with timestamps *and* colour (journalctl
+                           gives you one or the other, not both)
 tools/                     regression tests, each named for the bug it pins down
 tools/alsa-stub/           ALSA stub with a PCM state machine, so `make check`
                            needs no sound card
