@@ -496,6 +496,32 @@ each per-stream buffer above that ceiling with headroom for what is already
 in the socket. The reference implementations use 8 MiB and 16 MiB
 respectively.
 
+### CAPS reports lists as well as maxima
+
+`max_sample_rate_pcm` and `max_bits_per_sample` are what a sender negotiates
+against, and they are enough to decide whether a track can play. They are not
+enough to explain a refusal, because a maximum cannot describe a gap:
+
+- a DAC accepting 44.1/48/96/192 but **not** 88.2 reports the same `192000` as
+  one accepting every rate;
+- a DAC offering **only** `S32_LE` reports the same `32` as one that also
+  offers 16 and 24.
+
+Both are ordinary hardware, and both cost real diagnosis time before
+`pcm_rate_mask`, `pcm_format_mask` and `dsd_format_mask` existed — a 16-bit
+track failing against an endpoint whose CAPS said "32 bits" reads as a sender
+bug until someone runs `aplay --dump-hw-params` by hand.
+
+The masks are additive, appended after `feature_flags`, and covered by the
+same length rule as everything else in CAPS: a receiver sending 16 or 20 bytes
+is still valid, and a sender must treat the absent fields as zero.
+
+**Zero means "not reported", never "supports nothing".** An older daemon omits
+the fields entirely; a daemon that could not probe its device sends them empty
+rather than inventing a list. A sender that read zero as an empty capability
+set would refuse everything against exactly the endpoints that already have a
+problem.
+
 ### Cancelling a preannounce
 
 A preannounce isn't a commitment — the sender can legitimately abandon it

@@ -14,6 +14,11 @@ been tested yet is a real DAC on real Pi5 hardware: no sandbox here has
 sound hardware attached, so `snd_pcm_open` failing gracefully is as far as
 verification could go without you plugging in the real thing.
 
+New here? **`ARCHITECTURE.md`** explains how the protocol works and why —
+the two-ring gapless mechanism, what `sample_rate` means for DSD, and the
+constraints that come from control and audio sharing one socket. This file is
+about running it.
+
 ## Offline self-tests
 
 ```
@@ -283,11 +288,46 @@ halo: now playing: Love Forever — Paula Tsui · Paula Tsui Best Collection
 [halo] DSD64 native 1-bit 2.822 MHz @ 88.2 kHz 2ch | fmt#3 | ring 10% | 0:00:03 | xrun 1
 ```
 
-The status line prints on change plus a heartbeat, not on a fixed tick — under
-journald a line every second is pure noise. Two rates appear for DSD and DoP
-because they differ: the MHz figure is the music, the kHz figure is what the
-card is clocked at, and only the second can be checked against
-`aplay --dump-hw-params` or the DAC's own display.
+Two rates appear for DSD and DoP because they differ: the MHz figure is the
+music, the kHz figure is what the card is clocked at, and only the second can
+be checked against `aplay --dump-hw-params` or the DAC's own display.
+
+### What makes the status line print
+
+On change, plus a 30-second heartbeat while a stream is open — never on a
+fixed tick, and never at all while idle. The elapsed time and a healthy ring
+percentage are deliberately *not* part of what counts as a change: both move
+several times a second, and including them made the filter print always. A
+twelve-hour journal held 27,426 lines, 23,649 of them this one line.
+
+A ring **below 15%** is the exception: there, each 5% step it loses prints.
+That is the one thing worth watching, because it is what a gapless boundary
+looks like from here and what precedes every underrun, and at a 30-second
+heartbeat the whole story happens between two lines:
+
+```
+[halo] DSD64 ... | fmt#3 (+pending) | ring 10% | 0:00:32 | xrun 1
+[halo] DSD64 ... | fmt#3 (+pending) | ring  5% | 0:00:33 | xrun 1
+[halo] DSD64 ... | fmt#3 (+pending) | ring  0% | 0:00:34 | xrun 1
+halo: SWITCH_TO_PENDING format_id=4 (will flip when active ring drains)
+halo: gapless switch -> format_id=4 (no reopen)
+```
+
+The threshold has to sit below steady state or it is no filter at all —
+measured on a Pi 5 with a Gustard, a healthy DSD64 stream sits at 20-25%.
+
+### Track transitions: two kinds, and they are named
+
+Both reach the writer thread through the same pending-slot machinery, so the
+log used to call both a "gapless switch". They mean opposite things:
+
+| line | what happened |
+|---|---|
+| `preannounce received` then `gapless switch` | the sender announced the next track ahead of the boundary — true gapless |
+| `hard-cut FORMAT mid-stream` then `hard-cut switch` | a manual skip or seek; whatever was buffered was discarded |
+
+If a queue playing straight through shows only `hard-cut switch`, the sender
+is not preannouncing and every track boundary is paying for a restart.
 
 METADATA may also carry `coverart_ansi`, a terminal rendering of the cover
 the sender produced while making its thumbnail. The daemon prints it once per
@@ -317,10 +357,29 @@ without playback noticing.
 
 ## Things you will likely need to tune per-DAC
 
-- **Buffer/period sizing** in `open_locked()` (`src/alsa_output.c`):
-  currently targets a 500ms ALSA buffer / 8 periods. This is a starting
-  point for "never underrun on a home LAN," not a measured optimum — once
-  you have real hardware, watch for `UNDERRUN` messages and adjust.
+- **Buffer, period and start threshold** in `open_locked()`
+  (`src/alsa_output.c`): a 500ms ALSA buffer, ~10ms periods, and a 30ms
+  start threshold. The three are not one knob, and conflating them is how
+  this went wrong twice:
+  - the **buffer** covers how late the writer thread may be scheduled;
+  - the **period** sets how often it wakes, and is the unit the start
+    threshold's safety is really measured in (30ms is three periods);
+  - the **start threshold** decides only how much cushion playback begins
+    with. ALSA defaults it to *one frame*, which starts the device on an
+    empty buffer — that alone produced an `UNDERRUN` on every seek and
+    every track cut. Tying it to the buffer instead is the opposite error:
+    no sound until 500ms had arrived, which at 768kHz PCM is three
+    megabytes, and dragging the seek bar felt like it was fighting back.
+- **Prime threshold** in `alsa_writer_thread()` (`src/main.c`): 300ms of
+  audio must be in the ring before the first bytes of a stream are handed
+  to ALSA. This is the one that actually stops post-seek underruns, and it
+  is not a bigger version of the start threshold — no start threshold can
+  cover a supply gap without also making every seek wait that long. A
+  sender re-seeks its decoder before it can send anything (250-600ms
+  measured, on a NAS over Wi-Fi), and an *unstarted* device cannot
+  underrun. Waiting on the ring costs nothing: the silence lasts as long as
+  the sender takes either way, and the audio arrives in a burst, so the
+  cushion fills in milliseconds once it does.
 - **Real-time priority**: `halo_set_realtime_priority()` needs
   `CAP_SYS_NICE` and a raised `RLIMIT_MEMLOCK` to actually take effect —
   see "Running as a systemd service" below, the provided unit grants both.
@@ -373,13 +432,16 @@ implement, in order:
 ## Files
 
 ```
-PROTOCOL.md              wire protocol spec (read this first)
-src/protocol.h            shared struct/enum definitions
+ARCHITECTURE.md            how the protocol works, and why (read this first)
+PROTOCOL.md                wire protocol spec (normative)
+src/protocol.h             shared struct/enum definitions
 src/ring_buffer.h          lock-free SPSC ring buffer
 src/alsa_output.{h,c}      direct hw: ALSA device management
 src/net_io.h               framed-message socket helpers
 src/main.c                 TCP server, gapless state machine, threads
-tools/smoke_test_client.py throwaway protocol exerciser (not a real sender)
+tools/                     regression tests, each named for the bug it pins down
+tools/alsa-stub/           ALSA stub with a PCM state machine, so `make check`
+                           needs no sound card
 systemd/halo-daemon.service systemd unit (unprivileged user + RT capabilities)
 avahi/halo-daemon.service  mDNS/Bonjour service advertisement (static, no code)
 Makefile
